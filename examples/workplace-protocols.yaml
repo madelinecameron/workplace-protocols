@@ -1,0 +1,121 @@
+# Example fleet contract, annotated with MCP endpoints.
+#
+# Put this at ~/.workplace-protocols/workplace-protocols.yaml on the node
+# carrying your closet tag (discovery.DefaultRemotePath), then edit it.
+# discovery.Resolve finds that node by tag and reads the file over SSH.
+#
+# A tool's `server:` block is an MCP Registry server.json, written in YAML:
+# https://github.com/modelcontextprotocol/registry/tree/main/docs/reference/server-json
+# Without one, a tool is still installed and its version still diffed, but no
+# agent finds it. With one, `tools.Resolve` joins this catalog to live tailnet
+# status and `tools.Config` renders an MCP client configuration.
+#
+# Declaring an endpoint here grants no authority. It says where a server is,
+# not what a caller may do with it. Consumers that need a safety property —
+# the `sources` package, for instance — still name each tool in their own
+# allowlist and still require the server to declare `readOnlyHint=true` on it.
+
+tailnet: example.ts.net
+
+closet:
+  host: server
+  tag: tag:server
+
+hub:
+  remote: ssh://fleet@server.example.ts.net/opt/fleet/fleet-hub.git
+
+mirror:
+  host: you@server.example.ts.net
+  dir: /opt/fleet/fleet-mirrors
+
+registry:
+  remote: ssh://fleet@server.example.ts.net/opt/fleet/registry.git
+  path: ~/registry
+
+toolchain:
+  channel: stable
+  tools:
+    # ---- local servers -----------------------------------------------------
+    # A package with registryType `fleet` is a binary the fleet installs onto
+    # PATH. It runs as a stdio subprocess on the calling machine, and its
+    # identifier is the command. `server.version` must match the tool version
+    # (a leading "v" is ignored).
+    #
+    # Leave `where` off a tool you want every agent to call. A `where` tag on
+    # a local server means it only resolves on nodes carrying that tag —
+    # correct for something that must run beside its state, and a silent
+    # missing endpoint everywhere else.
+
+    - name: tracker
+      version: v0.2.6
+      role: agent
+      install_cmd: "tracker daemon --install"
+      server:
+        name: io.github.example/tracker
+        description: Workstation and repository state across the fleet
+        version: 0.2.6
+        packages:
+          - registryType: fleet
+            identifier: tracker
+            transport: {type: stdio}
+            packageArguments:
+              - {type: positional, value: mcp}
+
+    - name: deployer
+      version: v0.1.9
+      server:
+        name: io.github.example/deployer
+        description: Services, deployments and their health
+        version: 0.1.9
+        packages:
+          - registryType: fleet
+            identifier: deployer
+            transport: {type: stdio}
+            packageArguments:
+              - {type: positional, value: mcp}
+
+    - name: search-mcp
+      version: v0.1.0
+      server:
+        name: io.github.example/search
+        description: Code search across every indexed repository
+        version: 0.1.0
+        packages:
+          - registryType: fleet
+            identifier: search-mcp
+            transport: {type: stdio}
+
+    # ---- remote servers ----------------------------------------------------
+    # A remote is a long-running streamable-http server on the first online
+    # node carrying the tool's `where` tag. {host} in the url is filled with
+    # that node's MagicDNS name. A tool with no reachable node resolves to an
+    # explicit unreachable report, never a silent drop.
+
+    - name: mailbox
+      version: v0.1.4
+      role: agent
+      where: [tag:server]
+      server:
+        name: io.github.example/mailbox
+        description: Threaded mail between agents and people
+        version: 0.1.4
+        remotes:
+          - type: streamable-http
+            url: http://{host}:8788/mcp
+            variables:
+              host:
+                description: MagicDNS name of the node carrying tag:server
+                isRequired: true
+
+    # ---- catalog-only tools ------------------------------------------------
+    # No `server:`: the fleet installs and version-diffs these, but agents
+    # invoke them as CLIs or they run headless on a timer.
+
+    - name: importer
+      version: v0.1.2
+      build: ./cmd/importer
+      where: [tag:server]
+
+    - name: reports
+      version: v0.1.1
+      where: [tag:server]

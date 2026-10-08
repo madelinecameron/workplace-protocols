@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Correlation",
+  "description": "CloudEvents correlation extension attributes (correlationid, causationid) plus sessionid, restricted to namespaced references.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["correlationid"],
+  "properties": {
+    "correlationid": { "$ref": "#/$defs/namespacedRef" },
+    "causationid": { "$ref": "#/$defs/namespacedRef" },
+    "sessionid": { "$ref": "#/$defs/namespacedRef" }
+  },
+  "$defs": {
+    "namespacedRef": {
+      "type": "string",
+      "maxLength": 255,
+      "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)*:[^\\s]+$"
+    }
+  }
+}

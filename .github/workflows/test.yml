@@ -1,0 +1,35 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: astral-sh/setup-uv@v5
+      - run: go test ./...
+      - run: go vet ./...
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+      - name: validate protocol fixture
+        run: |
+          uvx --from check-jsonschema check-jsonschema \
+            --schemafile protocol/schema/v2/correlation.schema.json \
+            protocol/testdata/correlation.json
+      - name: validate example servers against the MCP Registry schema
+        run: |
+          mkdir -p "$RUNNER_TEMP/servers"
+          yq -o=json '.toolchain.tools[] | select(.server) | .server' -I=0 \
+            examples/workplace-protocols.yaml | split -l 1 - "$RUNNER_TEMP/servers/server-"
+          uvx --from check-jsonschema check-jsonschema --default-filetype json \
+            --schemafile https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json \
+            "$RUNNER_TEMP"/servers/server-*
