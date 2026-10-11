@@ -5,24 +5,27 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - run: go test ./...
       - run: go vet ./...
-      - uses: golangci/golangci-lint-action@v8
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: latest
+          version: v2.14.0
       - name: validate protocol fixture
         run: |
-          uvx --from check-jsonschema check-jsonschema \
+          uvx --from check-jsonschema==0.38.2 check-jsonschema \
             --schemafile protocol/schema/v2/correlation.schema.json \
             protocol/testdata/correlation.json
       - name: validate example servers against the MCP Registry schema
@@ -30,6 +33,6 @@ jobs:
           mkdir -p "$RUNNER_TEMP/servers"
           yq -o=json '.toolchain.tools[] | select(.server) | .server' -I=0 \
             examples/workplace-protocols.yaml | split -l 1 - "$RUNNER_TEMP/servers/server-"
-          uvx --from check-jsonschema check-jsonschema --default-filetype json \
+          uvx --from check-jsonschema==0.38.2 check-jsonschema --default-filetype json \
             --schemafile https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json \
             "$RUNNER_TEMP"/servers/server-*
