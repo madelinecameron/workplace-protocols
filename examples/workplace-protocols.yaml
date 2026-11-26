@@ -1,58 +1,54 @@
-# Example fleet contract, annotated with MCP endpoints.
+# Example workplace-protocols.yaml.
 #
-# Put this at ~/.workplace-protocols/workplace-protocols.yaml on the node
-# carrying your closet tag (discovery.DefaultRemotePath), then edit it.
-# discovery.Resolve finds that node by tag and reads the file over SSH.
+# Keep one copy on one node of your tailnet, at
+# ~/.workplace-protocols/workplace-protocols.yaml, and give that node the ACL
+# tag tag:workplace. discovery.Resolve finds the node by that tag and reads the
+# file over SSH, so every machine that reads it needs SSH access to that node
+# (Tailscale SSH works).
 #
-# A tool's `server:` block is an MCP Registry server.json, written in YAML:
-# https://github.com/modelcontextprotocol/registry/tree/main/docs/reference/server-json
-# Without one, a tool is still installed and its version still diffed, but no
-# agent finds it. With one, `tools.Resolve` joins this catalog to live tailnet
-# status and `tools.Config` renders an MCP client configuration.
-#
-# Declaring an endpoint here grants no authority. It says where a server is,
-# not what a caller may do with it. Consumers that need a safety property —
-# the `sources` package, for instance — still name each tool in their own
-# allowlist and still require the server to declare `readOnlyHint=true` on it.
+# Only `tailnet` is required. Your own tools can add top-level sections and
+# parse them from discovery.Manifest.Raw; readers ignore sections they do not
+# know.
 
+# Your tailnet's MagicDNS suffix.
 tailnet: example.ts.net
 
-closet:
-  host: server
-  tag: tag:server
+# Shared services that tools look up by name.
+services:
+  - name: postgres
+    host: server
+    kind: postgres
+    tags: [tag:server]
 
-hub:
-  remote: ssh://fleet@server.example.ts.net/opt/fleet/fleet-hub.git
-
-mirror:
-  host: you@server.example.ts.net
-  dir: /opt/fleet/fleet-mirrors
-
-registry:
-  remote: ssh://fleet@server.example.ts.net/opt/fleet/registry.git
-  path: ~/registry
-
+# Your tools, read by the `tools` package.
+#
+# A tool's `server:` block is a standard MCP Registry server.json, written in
+# YAML: https://github.com/modelcontextprotocol/registry/tree/main/docs/reference/server-json
+# tools.Resolve turns these into endpoints reachable from the calling machine,
+# and tools.Config renders them as `mcpServers` JSON for an MCP client.
+#
+# Declaring a server grants no authority. It says where a server is, not what a
+# caller may do with it.
 toolchain:
-  channel: stable
   tools:
     # ---- local servers -----------------------------------------------------
-    # A package with registryType `fleet` is a binary the fleet installs onto
-    # PATH. It runs as a stdio subprocess on the calling machine, and its
-    # identifier is the command. `server.version` must match the tool version
-    # (a leading "v" is ignored).
+    # registryType `fleet` means a command you install on your machines
+    # yourself. It runs as a stdio subprocess on the calling machine, and
+    # `identifier` is the command on PATH. `server.version` must match the
+    # tool version (a leading "v" is ignored).
     #
-    # Leave `where` off a tool you want every agent to call. A `where` tag on
-    # a local server means it only resolves on nodes carrying that tag —
-    # correct for something that must run beside its state, and a silent
-    # missing endpoint everywhere else.
+    # Leave `where` off a tool every machine should run. With a `where` tag,
+    # the tool only resolves on nodes carrying that tag.
 
     - name: tracker
       version: v0.2.6
+      # role and install_cmd are optional hints for whatever installs your
+      # tools. This library stores them and does nothing with them.
       role: agent
       install_cmd: "tracker daemon --install"
       server:
         name: io.github.example/tracker
-        description: Workstation and repository state across the fleet
+        description: Workstation and repository state
         version: 0.2.6
         packages:
           - registryType: fleet
@@ -86,14 +82,13 @@ toolchain:
             transport: {type: stdio}
 
     # ---- remote servers ----------------------------------------------------
-    # A remote is a long-running streamable-http server on the first online
-    # node carrying the tool's `where` tag. {host} in the url is filled with
-    # that node's MagicDNS name. A tool with no reachable node resolves to an
-    # explicit unreachable report, never a silent drop.
+    # A remote is a streamable-http server running on the first online node
+    # that carries the tool's `where` tag. {host} in the url is filled with
+    # that node's MagicDNS name. If no such node is online, Resolve reports
+    # the tool as unreachable instead of dropping it.
 
     - name: mailbox
       version: v0.1.4
-      role: agent
       where: [tag:server]
       server:
         name: io.github.example/mailbox
@@ -107,9 +102,9 @@ toolchain:
                 description: MagicDNS name of the node carrying tag:server
                 isRequired: true
 
-    # ---- catalog-only tools ------------------------------------------------
-    # No `server:`: the fleet installs and version-diffs these, but agents
-    # invoke them as CLIs or they run headless on a timer.
+    # ---- tools without an MCP server ---------------------------------------
+    # CLIs and background jobs that agents do not call directly. They stay in
+    # the list so their versions are recorded.
 
     - name: importer
       version: v0.1.2

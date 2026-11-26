@@ -8,11 +8,9 @@ import (
 	"github.com/madelinecameron/workplace-protocols/tailnet"
 )
 
-// examples/workplace-protocols.yaml is what an operator copies to start a
-// manifest. An example that no longer parses is
-// worse than no example, because it is discovered by being pasted into the one
-// file the whole fleet converges against. These tests read the shipped bytes
-// rather than a copy, so drift fails here instead of on a machine.
+// examples/workplace-protocols.yaml is what people copy to start a manifest.
+// These tests read the shipped file rather than a copy, so an example that
+// stops parsing fails here instead of on someone's machine.
 func exampleCatalog(t *testing.T) *Catalog {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join("..", "examples", "workplace-protocols.yaml"))
@@ -69,23 +67,23 @@ func TestShippedExampleDemonstratesEveryKind(t *testing.T) {
 	}
 }
 
-// Resolve against a synthetic tailnet: the closet is online and carries
-// tag:server, and we are a workstation. Every declared endpoint should
-// come back reachable, and Config should render each one in the shape an MCP
-// client consumes.
-func TestShippedExampleResolvesOnAHealthyFleet(t *testing.T) {
+// Resolve against a synthetic tailnet: a server carrying tag:server is
+// online, and we are a workstation. Every declared endpoint should come back
+// reachable, and Config should render each one in the shape an MCP client
+// consumes.
+func TestShippedExampleResolvesOnAHealthyTailnet(t *testing.T) {
 	c := exampleCatalog(t)
 	self := &tailnet.Node{Host: "laptop", Tags: []string{"tag:workstation"}, Online: true}
-	closet := &tailnet.Node{
+	server := &tailnet.Node{
 		Host:    "server",
 		DNSName: "server.example.ts.net",
 		Tags:    []string{"tag:server"},
 		Online:  true,
 	}
 
-	eps, err := Resolve(c, &tailnet.Status{Self: self, Nodes: []*tailnet.Node{self, closet}})
+	eps, err := Resolve(c, &tailnet.Status{Self: self, Nodes: []*tailnet.Node{self, server}})
 	if err != nil {
-		t.Fatalf("Resolve on a healthy fleet: %v", err)
+		t.Fatalf("Resolve on a healthy tailnet: %v", err)
 	}
 
 	declared := 0

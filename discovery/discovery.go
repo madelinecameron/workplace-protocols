@@ -1,13 +1,16 @@
-// Package discovery is the bootstrap layer: a small manifest
-// (workplace-protocols.yaml) describing tailnet-level facts — where the git hub
-// and snapshot mirror live, where the service registry is, which box is the
-// always-on "closet" — plus the resolver that finds and reads it.
+// Package discovery finds and reads the manifest: one YAML file, kept on one
+// node of your tailnet, that every tool and agent reads to learn the same facts.
 //
-// The design keeps the discovery root in Tailscale, not in a service. Exactly
-// one fact is out-of-band: which node is the closet box, encoded as an ACL tag
-// (default tag:closet). Everything else is derived by reading the manifest from
-// that node. A fresh daemon can therefore self-configure with no coordinator
-// running: find the closet by tag, read workplace-protocols.yaml, done.
+// You mark the node that holds the file with a Tailscale ACL tag (DefaultTag
+// unless you choose another). Resolve finds a node carrying that tag in
+// `tailscale status` and reads the file from it over SSH. Nothing else has to
+// be running, so a tool can configure itself on a fresh machine.
+//
+// This package reads only the fields every consumer needs. Other sections of
+// the same file belong to whoever reads them: tools.ParseCatalog reads
+// `toolchain`, and your own tools can add and parse sections of their own from
+// Manifest.Raw. Unknown top-level keys are ignored here, so adding a section
+// never breaks another reader.
 package discovery
 
 import (
@@ -20,60 +23,33 @@ import (
 )
 
 const (
-	// DefaultClosetTag is the ACL tag that marks the always-on box holding the
-	// protocol manifest. It is the single out-of-band bootstrap fact.
-	DefaultClosetTag = "tag:closet"
-	// DefaultRemotePath is where the manifest is read from on the closet box.
+	// DefaultTag is the ACL tag Resolve looks for when the caller passes none.
+	DefaultTag = "tag:workplace"
+	// DefaultRemotePath is where SSHReader reads the manifest on that node.
 	DefaultRemotePath = "~/.workplace-protocols/workplace-protocols.yaml"
 )
 
-// Manifest is the parsed workplace-protocols.yaml: tailnet-level facts both tools read.
+// Manifest is the part of workplace-protocols.yaml this package defines.
 type Manifest struct {
+	// Tailnet is the tailnet's MagicDNS suffix, such as example.ts.net.
 	Tailnet  string    `yaml:"tailnet" json:"tailnet"`
-	Closet   Closet    `yaml:"closet" json:"closet"`
-	Hub      Hub       `yaml:"hub" json:"hub"`
-	Mirror   Mirror    `yaml:"mirror" json:"mirror"`
-	Registry Registry  `yaml:"registry" json:"registry"`
 	Services []Service `yaml:"services,omitempty" json:"services,omitempty"`
+
+	// Host is the node Resolve read the manifest from. Parse leaves it empty.
+	Host string `yaml:"-" json:"host,omitempty"`
+	// Raw is the whole file, for parsing sections this package does not define.
+	Raw []byte `yaml:"-" json:"-"`
 }
 
-// Closet identifies the always-on box that holds the manifest.
-type Closet struct {
-	Host string `yaml:"host" json:"host"`
-	Tag  string `yaml:"tag,omitempty" json:"tag,omitempty"` // defaults to DefaultClosetTag
-}
-
-// Hub is the shared git hub that workstations sync through.
-type Hub struct {
-	Remote string `yaml:"remote,omitempty" json:"remote,omitempty"`
-}
-
-// Mirror is where workstation snapshots are mirrored.
-type Mirror struct {
-	Host string `yaml:"host,omitempty" json:"host,omitempty"`
-	Dir  string `yaml:"dir,omitempty" json:"dir,omitempty"`
-}
-
-// Registry is the service registry location.
-type Registry struct {
-	Remote string `yaml:"remote,omitempty" json:"remote,omitempty"`
-	Path   string `yaml:"path,omitempty" json:"path,omitempty"`
-}
-
-// Service is an optional shared service on the tailnet.
+// Service is a shared service on the tailnet that tools look up by name, such
+// as a database or a dashboard.
 type Service struct {
-	Name string   `yaml:"name" json:"name"`
-	Host string   `yaml:"host,omitempty" json:"host,omitempty"`
+	Name string `yaml:"name" json:"name"`
+	// Host is the node the service runs on.
+	Host string `yaml:"host,omitempty" json:"host,omitempty"`
+	// Kind is a free-form label, such as postgres or dashboard.
 	Kind string   `yaml:"kind,omitempty" json:"kind,omitempty"`
 	Tags []string `yaml:"tags,omitempty" json:"tags,omitempty"`
-}
-
-// ClosetTag returns the tag that marks the closet box, defaulting when unset.
-func (m *Manifest) ClosetTag() string {
-	if m.Closet.Tag != "" {
-		return m.Closet.Tag
-	}
-	return DefaultClosetTag
 }
 
 // Parse decodes workplace-protocols.yaml bytes.
@@ -82,26 +58,26 @@ func Parse(data []byte) (*Manifest, error) {
 	if err := yaml.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parse workplace protocols manifest: %w", err)
 	}
+	m.Raw = data
 	return &m, nil
 }
 
-// Validate checks the manifest carries enough to be useful. It is intentionally
-// lenient — a manifest may describe only the hub, or only the registry — but a
-// tailnet and a closet host are always required, and it must point at something.
+// Validate checks the fields this package defines and reports every problem at
+// once.
 func (m *Manifest) Validate() error {
 	var problems []string
 	if m.Tailnet == "" {
 		problems = append(problems, "tailnet: required")
 	}
-	if m.Closet.Host == "" {
-		problems = append(problems, "closet.host: required")
-	}
-	if m.Hub.Remote == "" && m.Registry.Remote == "" && m.Registry.Path == "" && len(m.Services) == 0 {
-		problems = append(problems, "manifest points at nothing (set hub, registry, or services)")
-	}
+	seen := make(map[string]bool, len(m.Services))
 	for i, s := range m.Services {
-		if s.Name == "" {
+		switch {
+		case s.Name == "":
 			problems = append(problems, fmt.Sprintf("services[%d]: name required", i))
+		case seen[s.Name]:
+			problems = append(problems, fmt.Sprintf("services[%d]: %q listed twice", i, s.Name))
+		default:
+			seen[s.Name] = true
 		}
 	}
 	if len(problems) > 0 {
@@ -110,24 +86,22 @@ func (m *Manifest) Validate() error {
 	return nil
 }
 
-// Reader reads the raw workplace protocols manifest bytes from a closet host. It is injected
-// so Resolve is testable without SSH.
+// Reader returns the manifest bytes held on host. Resolve takes one so that the
+// transport can be swapped, and so it can be tested without SSH.
 type Reader func(host string) ([]byte, error)
 
-// Resolve discovers the manifest: find the tailnet node carrying the closet tag,
-// read the manifest from it, then parse and validate. tag defaults to
-// DefaultClosetTag when empty. This is the whole bootstrap — no service, one
-// round trip, keyed off a Tailscale tag.
+// Resolve finds an online node carrying tag (DefaultTag when empty), reads the
+// manifest from it with read, and parses and validates it.
 func Resolve(st *tailnet.Status, tag string, read Reader) (*Manifest, error) {
 	if st == nil {
 		return nil, fmt.Errorf("no tailnet status (is tailscale up?)")
 	}
 	if tag == "" {
-		tag = DefaultClosetTag
+		tag = DefaultTag
 	}
 	nodes := st.ByTag(tag)
 	if len(nodes) == 0 {
-		return nil, fmt.Errorf("no tailnet node carries %q — tag your closet box to bootstrap workplace protocols", tag)
+		return nil, fmt.Errorf("no tailnet node carries %q: tag the node that holds the manifest, or pass the tag you use", tag)
 	}
 	node := pickReachable(nodes)
 	host := node.DNSName
@@ -145,12 +119,13 @@ func Resolve(st *tailnet.Status, tag string, read Reader) (*Manifest, error) {
 	if err := m.Validate(); err != nil {
 		return nil, err
 	}
+	m.Host = host
 	return m, nil
 }
 
-// SSHReader returns a Reader that runs `ssh <host> cat <path>` (path defaults to
-// DefaultRemotePath). This is the default bootstrap transport: no extra service,
-// just the SSH already gating the tailnet.
+// SSHReader returns a Reader that runs `ssh <host> cat <path>`, with path
+// defaulting to DefaultRemotePath. The calling user must be able to SSH to the
+// node without a prompt, for example with Tailscale SSH or a key.
 func SSHReader(path string) Reader {
 	if path == "" {
 		path = DefaultRemotePath
@@ -164,8 +139,8 @@ func SSHReader(path string) Reader {
 	}
 }
 
-// pickReachable prefers an online node so bootstrap doesn't try a box that is
-// down when another tagged node could answer.
+// pickReachable prefers an online node, so Resolve does not try a node that is
+// down while another tagged node could answer.
 func pickReachable(nodes []*tailnet.Node) *tailnet.Node {
 	for _, n := range nodes {
 		if n.Online {
