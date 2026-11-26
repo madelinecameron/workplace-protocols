@@ -4,11 +4,10 @@
 // were told the same name in different letter case, or with a stray slash, key
 // the same thing.
 //
-// It is shared, not copied, for the same reason repoid is: addressing only works
-// if every tool computes a byte-identical id. Mail resolves a recipient by
-// address without asking a service; a message store, a relay, and a sender that
-// disagree about whether "Scout" and "scout" are one agent deliver mail twice or not
-// at all.
+// Every tool that names agents should use this package rather than its own
+// copy, because addressing only works if they all compute byte-identical ids.
+// A sender and a message store that disagree about whether "Scout" and "scout"
+// are one agent deliver a message twice, or not at all.
 //
 // Identity here is persistent and coarse: an address names something you can
 // send to and expect an answer from, not one run of it. A single run is a
@@ -37,11 +36,10 @@ type Kind string
 const (
 	// KindAgent names a piece of software that acts: scout, reviewer, a session.
 	KindAgent Kind = "agent"
-	// KindHuman names a person. Humans are addressable exactly like agents;
-	// delivery to them happens through a relay, not through the store.
+	// KindHuman names a person. Humans are addressed exactly like agents.
 	KindHuman Kind = "human"
 	// KindRole names a position rather than an occupant: owner/acme,
-	// reviewer. Roles resolve to concrete recipients at send time.
+	// reviewer. The system that delivers to it decides who holds the role.
 	KindRole Kind = "role"
 )
 
@@ -102,8 +100,6 @@ func (a Address) String() string { return string(a.Kind) + ":" + a.Name }
 func (a Address) ID() string { return idhash.Sum("addr:" + a.String()) }
 
 // IsRole reports whether the address names a position rather than an occupant.
-// Roles cannot be the final recipient of a delivery: something has to resolve
-// them first.
 func (a Address) IsRole() bool { return a.Kind == KindRole }
 
 // Valid reports whether the address is usable. It is false for the zero value.
@@ -147,8 +143,7 @@ const EnvVar = "WORKPLACE_PROTOCOLS_AGENT"
 
 // FromEnv resolves the current process's address from EnvVar. It returns an
 // error rather than a fallback: an agent that does not know its own name should
-// fail loudly at startup, not send mail from a plausible-looking guess that
-// nobody can reply to.
+// fail at startup, not act under a guessed name nobody can reply to.
 func FromEnv() (Address, error) {
 	raw := strings.TrimSpace(os.Getenv(EnvVar))
 	if raw == "" {

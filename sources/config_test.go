@@ -17,6 +17,23 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
+func TestShippedExampleLoadsAndValidates(t *testing.T) {
+	config, err := Load(filepath.Join("..", "examples", "sources.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Validate(); err != nil {
+		t.Fatalf("the shipped example does not validate: %v", err)
+	}
+	kinds := map[Transport]bool{}
+	for _, server := range config.Servers {
+		kinds[server.Kind()] = true
+	}
+	if !kinds[TransportStdio] || !kinds[TransportHTTP] {
+		t.Fatal("the shipped example should show both a stdio and an http server")
+	}
+}
+
 func TestLoadIsStrict(t *testing.T) {
 	tests := []struct {
 		name    string

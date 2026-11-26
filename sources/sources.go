@@ -1,4 +1,4 @@
-// Package sources is a client-side plane for reading from explicitly
+// Package sources is an MCP client for reading from explicitly
 // allowlisted, read-only MCP servers.
 //
 // It exists because an agent that answers questions about the world needs to
@@ -11,8 +11,8 @@
 // Discovery grants nothing. Connecting to a server and listing its tools can
 // only confirm that the names an operator already wrote down exist and are
 // declared read-only. A server that offers more tools, renames one, or drops
-// the read-only declaration does not widen what the plane will call; it makes
-// the plane refuse. A server that fails any part of that contract is closed and
+// the read-only declaration does not widen what this package will call; it makes
+// the package refuse. A server that fails any part of that contract is closed and
 // reported as a blind spot, and the remaining servers stay usable, so one
 // broken source degrades the agent's sight rather than its whole session.
 //
@@ -45,7 +45,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Reasons reported for a server the plane could not bring up. They are fixed
+// Reasons reported for a server Open could not bring up. They are fixed
 // per transport so that nothing derived from an error, a command line or an
 // endpoint can reach a model through them.
 const (
@@ -88,7 +88,7 @@ func (r Result) Omitted() bool {
 }
 
 // An Option adjusts how a Set behaves at run time. Options belong to the
-// service embedding the plane rather than to the operator, so they are not part
+// service embedding this package rather than to the operator, so they are not part
 // of the config file an operator reviews.
 type Option func(*settings)
 
@@ -167,7 +167,7 @@ func (t Tool) Call(ctx context.Context, args map[string]any) (Result, error) {
 	return t.call(ctx, args)
 }
 
-// A BlindSpot is a configured server the plane could not bring up. Reason is
+// A BlindSpot is a configured server Open could not bring up. Reason is
 // safe to show a model; Err holds the underlying failure for logs.
 type BlindSpot struct {
 	ServerID string
@@ -366,8 +366,8 @@ func clientTransport(server Server, conf settings) (mcp.Transport, error) {
 	return &mcp.CommandTransport{Command: command(server)}, nil
 }
 
-// command builds the child process for a stdio server. The context that opened
-// the plane is deliberately not attached: the child's lifetime is the Set's,
+// command builds the child process for a stdio server. The context passed to
+// Open is deliberately not attached: the child's lifetime is the Set's,
 // and Close is what ends it.
 func command(server Server) *exec.Cmd {
 	cmd := exec.Command(server.Command, server.Args...)

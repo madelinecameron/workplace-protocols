@@ -1,19 +1,17 @@
-// Package tools is the discovery layer for a fleet's own tools: which tool
-// exists, at which version, on which host, and how an agent reaches its MCP
-// endpoint.
+// Package tools reads the `toolchain` section of workplace-protocols.yaml: a
+// list of your tools, the version of each, and how an agent reaches its MCP
+// server.
 //
-// Without it, every agent has each MCP server registered by hand on every
-// machine, and those registrations drift apart. Here the `toolchain` block of
-// workplace-protocols.yaml is the single source. A tool's MCP endpoint is
-// declared as a standard MCP Registry server.json under `server`; Resolve
-// turns that plus a tailnet status into concrete endpoints (honouring the
-// `where` tags that decide which boxes run which daemon), and Config renders
-// them as an MCP client configuration. No service is involved.
+// Without a shared list, each MCP server is registered by hand in each agent
+// on each machine, and those registrations drift apart. Here every tool's MCP
+// server is declared once, as a standard MCP Registry server.json under
+// `server`. Resolve combines the list with `tailscale status` to find where
+// each server is reachable from this machine, and Config renders the result as
+// the `mcpServers` JSON that MCP clients such as Claude Code accept.
 //
-// It does not do allowlisting or audit. Those need a gateway, which would be a
-// running service everything depends on. Every caller on this plane is
-// trusted; when that stops being true, this package still names what a gateway
-// would front.
+// It does not control who may call what. Declaring a server says where it is,
+// not what a caller may do with it; put a gateway or the server's own auth in
+// front of anything that needs that.
 package tools
 
 import (
@@ -32,13 +30,15 @@ import (
 	"github.com/madelinecameron/workplace-protocols/tailnet"
 )
 
-// DefaultChannel is the toolchain channel a manifest tracks when unset.
+// DefaultChannel is the release channel ParseCatalog sets when the manifest
+// names none. This package only records it; an installer that reads the
+// catalog can use it to pick builds.
 const DefaultChannel = "stable"
 
-// RegistryTypeFleet is the server.json package registryType for a binary the
-// fleet installs onto PATH itself. The package identifier is the command to
-// run. No standard registryType covers that case, so public registries will
-// not accept it.
+// RegistryTypeFleet is the server.json package registryType for a command you
+// install on your machines yourself, by any means. The package identifier is
+// the command, and it must be on PATH. No standard registryType covers that
+// case, so public MCP registries will not accept these entries.
 const RegistryTypeFleet = "fleet"
 
 // HostVariable is the remote URL variable Resolve fills with the name of the
@@ -51,38 +51,40 @@ var (
 	urlVariablePattern = regexp.MustCompile(`\{([a-zA-Z_][a-zA-Z0-9_]*)\}`)
 )
 
-// Catalog is the parsed `toolchain` block of workplace-protocols.yaml — the fleet's
-// contract for which tools exist at which version.
+// Catalog is the parsed `toolchain` section: which tools exist, and at which
+// version.
 type Catalog struct {
 	Channel string `yaml:"channel,omitempty" json:"channel,omitempty"`
 	Tools   []Tool `yaml:"tools" json:"tools"`
 }
 
-// Tool is one internal tool: a pinned version, optionally a daemon role, the
-// tags constraining where it runs, and optionally the MCP server it exposes.
+// Tool is one of your tools: its pinned version, the tags of the nodes it runs
+// on, and optionally the MCP server it exposes.
 type Tool struct {
-	Name    string `yaml:"name" json:"name"`
+	Name string `yaml:"name" json:"name"`
+	// Version is the version you expect installed. An installer can compare it
+	// with what a machine has.
 	Version string `yaml:"version" json:"version"`
-	Role    string `yaml:"role,omitempty" json:"role,omitempty"`
 
-	// Build is the main-package path the publisher compiles, e.g.
-	// "./cmd/importer". Empty lets the publisher fall back to
-	// ./cmd/<name> and then the module root — which is right until a repo's
-	// binary is named differently from the repo.
-	Build string `yaml:"build,omitempty" json:"build,omitempty"`
-
-	// InstallCmd is run once, idempotently, for a tool that installs and
-	// supervises its own unit. A tool sets this or it gets a unit written for
-	// it; setting both means two things believe they own the daemon.
-	InstallCmd string `yaml:"install_cmd,omitempty" json:"install_cmd,omitempty"`
-
+	// Where limits the tool to nodes carrying one of these ACL tags. Empty
+	// means every machine.
 	Where []string `yaml:"where,omitempty" json:"where,omitempty"`
 
 	// Server is the tool's MCP server as an MCP Registry server.json. A tool
-	// without one is a CLI the fleet installs but no agent calls directly; it
-	// stays in the catalog so its version can still be diffed against what is
-	// installed.
+	// without one is a CLI or a background job that agents do not call
+	// directly; it stays in the catalog so its version is still recorded.
 	Server *apiv0.ServerJSON `yaml:"-" json:"server,omitempty"`
+
+	// Role, Build and InstallCmd are hints for whatever installs your tools.
+	// This package stores them and acts on none of them.
+
+	// Role is a free-form label, such as agent or daemon.
+	Role string `yaml:"role,omitempty" json:"role,omitempty"`
+	// Build is the main package to compile, such as ./cmd/importer.
+	Build string `yaml:"build,omitempty" json:"build,omitempty"`
+	// InstallCmd is a command the tool provides to install itself, such as
+	// "tracker daemon --install".
+	InstallCmd string `yaml:"install_cmd,omitempty" json:"install_cmd,omitempty"`
 }
 
 // UnmarshalYAML decodes a tool, rejecting fields it does not define, and reads
@@ -155,9 +157,8 @@ type Endpoint struct {
 	Args    []string
 }
 
-// ParseCatalog decodes the `toolchain` block out of workplace-protocols.yaml bytes. It reads
-// the whole manifest and keeps only the toolchain, so callers can pass the same
-// bytes discovery.Parse gets.
+// ParseCatalog decodes the `toolchain` section out of workplace-protocols.yaml
+// bytes and ignores the rest, so it can take discovery.Manifest.Raw.
 func ParseCatalog(data []byte) (*Catalog, error) {
 	var wrapper struct {
 		Toolchain Catalog `yaml:"toolchain"`
@@ -172,9 +173,8 @@ func ParseCatalog(data []byte) (*Catalog, error) {
 	return &c, nil
 }
 
-// Validate reports every problem at once rather than the first, because these
-// are edited by hand and a manifest with three mistakes should not take three
-// runs to fix.
+// Validate reports every problem at once rather than stopping at the first,
+// since the file is edited by hand.
 func (c *Catalog) Validate() error {
 	var problems []string
 	seen := make(map[string]bool, len(c.Tools))
@@ -184,14 +184,12 @@ func (c *Catalog) Validate() error {
 		case t.Name == "":
 			problems = append(problems, fmt.Sprintf("tools[%d]: name required", i))
 		case seen[t.Name]:
-			// Two entries for one name make "which version is installed?"
-			// unanswerable, which is the question the catalog exists for.
 			problems = append(problems, fmt.Sprintf("tools[%d]: %q listed twice", i, t.Name))
 		default:
 			seen[t.Name] = true
 		}
 		if t.Version == "" {
-			problems = append(problems, fmt.Sprintf("tools[%d] (%s): version required — an unpinned tool cannot be diffed against what is installed", i, t.Name))
+			problems = append(problems, fmt.Sprintf("tools[%d] (%s): version required", i, t.Name))
 		}
 		for _, w := range t.Where {
 			if !strings.HasPrefix(w, "tag:") {
@@ -324,15 +322,13 @@ func (c *Catalog) Names() []string {
 // Call Validate first; Resolve reports tools it cannot use as unreachable
 // rather than repeating every validation rule.
 //
-// Tools with no server are skipped: they are installed, not called. A remote
-// is resolved against the tailnet — it is served by the first online node
-// carrying one of its `where` tags, whose name fills {host}. A package
-// resolves locally and is skipped when `where` excludes this machine, because
-// the binary will not be installed here.
+// Tools with no server are skipped. A remote is served by the first online
+// node carrying one of its `where` tags, and that node's name fills {host}. A
+// package runs on this machine, and is skipped when `where` excludes this
+// machine, because the command will not be installed here.
 //
-// st may be nil: packages still resolve, remotes are reported as unreachable.
-// That keeps a workstation with tailscale down from losing access to the
-// local plane.
+// st may be nil: packages still resolve and remotes are reported as
+// unreachable, so local tools keep working while Tailscale is down.
 func Resolve(c *Catalog, st *tailnet.Status) ([]Endpoint, error) {
 	if c == nil {
 		return nil, fmt.Errorf("no catalog")
@@ -379,9 +375,8 @@ func Resolve(c *Catalog, st *tailnet.Status) ([]Endpoint, error) {
 
 	sort.Slice(out, func(i, j int) bool { return out[i].Tool.Name < out[j].Tool.Name })
 	if len(unreach) > 0 {
-		// Partial results plus an error: a caller that wants everything can
-		// fail, and a caller that wants what it can get still has it. Silently
-		// dropping a tool is how registrations drift apart.
+		// Partial results plus an error: a caller that needs every tool can
+		// fail, and one that takes what it can get still has the rest.
 		return out, fmt.Errorf("unreachable: %s", strings.Join(unreach, "; "))
 	}
 	return out, nil
@@ -456,9 +451,9 @@ type Server struct {
 	URL     string   `json:"url,omitempty"`
 }
 
-// Config renders endpoints as the `mcpServers` map every MCP client accepts, so
-// an agent's registration is generated from the fleet contract instead of being
-// retyped against it. Marshal it as JSON under whatever key the client wants.
+// Config renders endpoints as the `mcpServers` map MCP clients accept, so an
+// agent's server list is generated from the catalog instead of typed by hand.
+// Marshal it as JSON under whatever key the client wants.
 func Config(endpoints []Endpoint) map[string]Server {
 	servers := make(map[string]Server, len(endpoints))
 	for _, e := range endpoints {
