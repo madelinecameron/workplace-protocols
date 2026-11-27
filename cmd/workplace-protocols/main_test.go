@@ -70,3 +70,23 @@ func TestListPrintsEveryEntry(t *testing.T) {
 		t.Fatalf("rows = %d, want 5", len(rows))
 	}
 }
+
+func TestServersJSONSeparatesWhatClaudeNeeds(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if err := run([]string{"-f", example, "servers", "-json"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	var rows []struct {
+		Name        string   `json:"name"`
+		Needs       []string `json:"needs"`
+		ClaudeNeeds []string `json:"claude_needs"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &rows); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if r.Name == "mailbox" && (len(r.Needs) != 1 || len(r.ClaudeNeeds) != 1) {
+			t.Fatalf("mailbox = %+v", r)
+		}
+	}
+}

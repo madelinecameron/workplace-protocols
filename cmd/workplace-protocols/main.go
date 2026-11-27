@@ -208,18 +208,21 @@ func servers(catalog *tools.Catalog, machine tools.Machine, stdout, stderr io.Wr
 }
 
 type serverRow struct {
-	Name      string   `json:"name"`
-	Transport string   `json:"transport"`
-	Target    string   `json:"target"`
-	Needs     []string `json:"needs"`
-	Projects  []string `json:"projects,omitempty"`
+	Name      string `json:"name"`
+	Transport string `json:"transport"`
+	Target    string `json:"target"`
+	// Needs is every variable the endpoint reads; ClaudeNeeds is the subset
+	// Claude Code reads, which a headers helper can make smaller.
+	Needs       []string `json:"needs"`
+	ClaudeNeeds []string `json:"claude_needs"`
+	Projects    []string `json:"projects,omitempty"`
 }
 
 func serversJSON(catalog *tools.Catalog, machine tools.Machine, stdout, stderr io.Writer) error {
 	rows := []serverRow{}
 	for _, e := range resolve(catalog, machine, stderr) {
 		transport, t := target(e)
-		rows = append(rows, serverRow{Name: e.Name, Transport: transport, Target: t, Needs: e.Refs(), Projects: e.Projects})
+		rows = append(rows, serverRow{Name: e.Name, Transport: transport, Target: t, Needs: e.Refs(), ClaudeNeeds: e.ForClaude().Refs(), Projects: e.Projects})
 	}
 	return writeJSON(stdout, rows)
 }
