@@ -78,7 +78,7 @@ func mcpEndpoints(t *testing.T, goos string) map[string]Endpoint {
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
-	eps, err := resolve(c, &tailnet.Status{Self: &tailnet.Node{Host: "laptop"}}, goos)
+	eps, err := resolve(c, &tailnet.Status{Self: &tailnet.Node{Host: "laptop"}}, goos, "")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -99,10 +99,14 @@ func TestEntriesCombineToolServersAndTheMCPList(t *testing.T) {
 	}
 }
 
-func TestMCPNameMayNotRepeatAToolName(t *testing.T) {
-	doc := "toolchain:\n  tools:\n    - name: docs\n      version: v1\n" + mcpSample[strings.Index(mcpSample, "mcp:"):]
+func TestMCPNameMayNotRepeatAToolServerName(t *testing.T) {
+	mcp := mcpSample[strings.Index(mcpSample, "mcp:"):]
+	if err := parse(t, "toolchain:\n  tools:\n    - name: docs\n      version: v1\n"+mcp).Validate(); err != nil {
+		t.Fatalf("a tool without a server may share a name with an mcp entry: %v", err)
+	}
+	doc := strings.Replace(mcpSample, "name: tracker\n", "name: docs\n", 1)
 	err := parse(t, doc).Validate()
-	if err == nil || !strings.Contains(err.Error(), "name already used") {
+	if err == nil || !strings.Contains(err.Error(), "another server already uses this name") {
 		t.Fatalf("error = %v, want a name collision", err)
 	}
 }
@@ -140,11 +144,21 @@ func TestClaudeConfigReferencesEnvironmentVariables(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := `{"mailbox":{"type":"http","url":"https://mailbox.example.ts.net/mcp",` +
-		`"headers":{"Authorization":"Bearer ${MAILBOX_TOKEN}","X-Client":"agent","X-Session":"${MAILBOX_SESSION}"},` +
+		`"headers":{"X-Client":"agent"},` +
 		`"headersHelper":"mailbox-headers"},` +
 		`"xcode":{"command":"uvx","args":["xcode-mcp"],"env":{"XCODE_KEY":"${XCODE_KEY}","XCODE_MODE":"build"}}}`
 	if string(data) != want {
 		t.Fatalf("config =\n%s\nwant\n%s", data, want)
+	}
+}
+
+func TestClaudeNeedsNoVariablesAHeadersHelperReplaces(t *testing.T) {
+	mailbox := mcpEndpoints(t, "darwin")["mailbox"]
+	if refs := mailbox.ForClaude().Refs(); len(refs) != 0 {
+		t.Fatalf("Claude's mailbox still reads %v", refs)
+	}
+	if refs := mailbox.Refs(); len(refs) != 2 {
+		t.Fatalf("mailbox refs = %v, want both for clients without the helper", refs)
 	}
 }
 

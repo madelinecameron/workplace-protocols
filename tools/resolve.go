@@ -18,6 +18,9 @@ import (
 type Endpoint struct {
 	Name    string
 	UseWhen string
+	// Projects, when set, limits the endpoint to these directories under the
+	// caller's code root.
+	Projects []string
 	// Node is the tailnet node serving a remote found by its where tag. Nil
 	// for a fixed URL and for a package, which runs on this machine.
 	Node *tailnet.Node
@@ -31,6 +34,66 @@ type Endpoint struct {
 	Command string
 	Args    []Template
 	Env     []Field
+}
+
+// Refs lists the environment variables the endpoint still reads, sorted.
+func (e Endpoint) Refs() []string {
+	seen := map[string]bool{}
+	add := func(t Template) {
+		for _, p := range t {
+			if p.Env != "" {
+				seen[p.Env] = true
+			}
+		}
+	}
+	add(e.URL)
+	for _, f := range append(slices.Clone(e.Headers), e.Env...) {
+		add(f.Value)
+	}
+	for _, a := range e.Args {
+		add(a)
+	}
+	return slices.Sorted(maps.Keys(seen))
+}
+
+// Fill replaces each reference to an environment variable that values holds
+// with its value. References to variables values lacks are left in place.
+func Fill(endpoints []Endpoint, values map[string]string) []Endpoint {
+	fill := func(t Template) Template {
+		var out Template
+		for _, p := range t {
+			if v, ok := values[p.Env]; ok && p.Env != "" {
+				out = out.appendText(v)
+				continue
+			}
+			if p.Env != "" {
+				out = append(out, p)
+				continue
+			}
+			out = out.appendText(p.Text)
+		}
+		return out
+	}
+	fields := func(fs []Field) []Field {
+		var out []Field
+		for _, f := range fs {
+			out = append(out, Field{Name: f.Name, Value: fill(f.Value)})
+		}
+		return out
+	}
+	out := make([]Endpoint, len(endpoints))
+	for i, e := range endpoints {
+		e.URL = fill(e.URL)
+		e.Headers = fields(e.Headers)
+		e.Env = fields(e.Env)
+		var args []Template
+		for _, a := range e.Args {
+			args = append(args, fill(a))
+		}
+		e.Args = args
+		out[i] = e
+	}
+	return out
 }
 
 // Remote reports whether the endpoint is reached over HTTP.
@@ -311,10 +374,25 @@ func buildRemote(ep *Endpoint, e Entry, r model.Transport, b *binder) []string {
 // st may be nil: packages and fixed URLs still resolve and tagged remotes are
 // reported as unreachable, so the rest keeps working while Tailscale is down.
 func Resolve(c *Catalog, st *tailnet.Status) ([]Endpoint, error) {
-	return resolve(c, st, runtime.GOOS)
+	return ResolveFor(c, st, Machine{OS: runtime.GOOS})
 }
 
-func resolve(c *Catalog, st *tailnet.Status, goos string) ([]Endpoint, error) {
+// Machine describes the machine endpoints are resolved for.
+type Machine struct {
+	// OS is the operating system as Go names it. Empty means runtime.GOOS.
+	OS string
+	// Role is the machine's role, matched against an entry's roles. An entry
+	// that lists roles is skipped when Role is empty.
+	Role string
+}
+
+// ResolveFor is Resolve for a stated machine. It also skips entries that are
+// disabled or whose roles exclude m.Role.
+func ResolveFor(c *Catalog, st *tailnet.Status, m Machine) ([]Endpoint, error) {
+	return resolve(c, st, cmp.Or(m.OS, runtime.GOOS), m.Role)
+}
+
+func resolve(c *Catalog, st *tailnet.Status, goos, role string) ([]Endpoint, error) {
 	if c == nil {
 		return nil, fmt.Errorf("no catalog")
 	}
@@ -328,7 +406,9 @@ func resolve(c *Catalog, st *tailnet.Status, goos string) ([]Endpoint, error) {
 	}
 
 	for _, e := range c.Entries() {
-		if e.Server == nil || len(e.OS) > 0 && !slices.Contains(e.OS, goos) {
+		if e.Server == nil || e.Disabled() ||
+			len(e.OS) > 0 && !slices.Contains(e.OS, goos) ||
+			len(e.Roles) > 0 && !slices.Contains(e.Roles, role) {
 			continue
 		}
 		remote := len(e.Server.Remotes) > 0
@@ -351,6 +431,7 @@ func resolve(c *Catalog, st *tailnet.Status, goos string) ([]Endpoint, error) {
 			continue
 		}
 		ep.Node = node
+		ep.Projects = e.Projects
 		out = append(out, ep)
 	}
 

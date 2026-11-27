@@ -147,10 +147,15 @@ Fields on the entry, next to `server:`:
 | `use_when` | When agents should reach for the server. server.json's `description` is capped at 100 characters; this isn't. |
 | `where` | On a remote: the tags of the nodes that serve it. `{host}` in the URL becomes the first online one. On a package: only machines carrying one of these tags run it. |
 | `os` | Only these operating systems get the server: `darwin`, `linux`, `windows`. |
+| `roles` | Only machines with one of these roles get the server. The caller states the machine's role (`-role laptop`); a machine with no role gets none of these servers. |
+| `projects` | Only these directories, relative to your code root, get the server. Claude Code gets them per project; Codex does not get them. |
+| `enabled` | `false` keeps the entry in the file and gives it to no machine. |
 | `env` | Maps each `{variable}` to the environment variable holding its value. |
-| `headers_helper` | A command that prints extra request headers for a remote. Only Claude Code gets it. |
+| `headers_helper` | A command that prints extra request headers for a remote. Only Claude Code gets it, and then gets only the headers that read no environment variable: the helper supplies the rest. |
 
-A name may appear in `toolchain` or `mcp`, not both.
+Two servers may not share a name. A tool without a `server:` may share its
+name with an `mcp` entry, such as a binary you install on one machine and
+serve to everyone from another.
 
 ### Secrets
 
@@ -172,6 +177,7 @@ a `.env` file, your shell) is up to you.
 ```sh
 workplace-protocols render claude > .mcp.json
 workplace-protocols render codex     # paste into ~/.codex/config.toml
+workplace-protocols -role laptop -values secrets.json render claude
 workplace-protocols servers          # what this machine gets, and how it reaches each
 ```
 
@@ -230,6 +236,16 @@ if err != nil {
 claude := map[string]any{"mcpServers": tools.Config(endpoints)}
 codex, err := tools.Codex(endpoints)
 ```
+
+`-role` picks the servers for a machine's role. `-values` takes a JSON object
+of environment variable values and writes each value into the config in place
+of its reference. Use it when the client won't have those variables, such as a
+Claude Code started from an editor rather than a shell. `render claude` then
+leaves out, and names, any server that still needs a variable.
+
+`servers -json` lists this machine's servers with the variables each still
+needs, and `list -json` prints every entry, including disabled ones, for
+whatever writes your docs.
 
 ### Rules for `server:` blocks
 

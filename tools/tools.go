@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"path"
 	"reflect"
 	"regexp"
 	"slices"
@@ -91,8 +92,11 @@ type Tool struct {
 	// without one is a CLI or a background job that agents do not call
 	// directly; it stays in the catalog so its version is still recorded.
 	Server *apiv0.ServerJSON `yaml:"-" json:"server,omitempty"`
-	// UseWhen, Env and HeadersHelper apply to Server, as on an Entry.
+	// UseWhen, Roles, Projects, Env and HeadersHelper apply to Server, as on
+	// an Entry.
 	UseWhen       string            `yaml:"use_when,omitempty" json:"use_when,omitempty"`
+	Roles         []string          `yaml:"roles,omitempty" json:"roles,omitempty"`
+	Projects      []string          `yaml:"projects,omitempty" json:"projects,omitempty"`
 	Env           map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
 	HeadersHelper string            `yaml:"headers_helper,omitempty" json:"headers_helper,omitempty"`
 
@@ -123,6 +127,14 @@ type Entry struct {
 	Where []string `yaml:"where,omitempty" json:"where,omitempty"`
 	// OS limits the server to these operating systems.
 	OS []string `yaml:"os,omitempty" json:"os,omitempty"`
+	// Roles limits the server to machines whose role, as the caller states it
+	// in Machine, is one of these. Empty means every machine.
+	Roles []string `yaml:"roles,omitempty" json:"roles,omitempty"`
+	// Projects makes the server available only inside these directories,
+	// given relative to the caller's code root. Empty means everywhere.
+	Projects []string `yaml:"projects,omitempty" json:"projects,omitempty"`
+	// Enabled false keeps the entry in the file but gives it to no machine.
+	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	// Env maps a {variable} used in the server block to the environment
 	// variable that holds its value.
 	Env map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
@@ -252,6 +264,8 @@ func (t Tool) entry() Entry {
 		UseWhen:       t.UseWhen,
 		Where:         t.Where,
 		OS:            t.OS,
+		Roles:         t.Roles,
+		Projects:      t.Projects,
 		Env:           t.Env,
 		HeadersHelper: t.HeadersHelper,
 		Server:        t.Server,
@@ -260,6 +274,9 @@ func (t Tool) entry() Entry {
 
 // Entries returns every MCP server in the catalog: the tools that declare a
 // server, then the `mcp` list.
+// Disabled reports whether the entry is parked with enabled: false.
+func (e Entry) Disabled() bool { return e.Enabled != nil && !*e.Enabled }
+
 func (c *Catalog) Entries() []Entry {
 	var out []Entry
 	for _, t := range c.Tools {
@@ -274,7 +291,8 @@ func (c *Catalog) Entries() []Entry {
 // since the file is edited by hand.
 func (c *Catalog) Validate() error {
 	var problems []string
-	seen := make(map[string]bool, len(c.Tools)+len(c.MCP))
+	seen := make(map[string]bool, len(c.Tools))
+	servers := make(map[string]bool, len(c.Tools)+len(c.MCP))
 
 	for i, t := range c.Tools {
 		at := fmt.Sprintf("tools[%d] (%s)", i, t.Name)
@@ -291,11 +309,12 @@ func (c *Catalog) Validate() error {
 		}
 		problems = append(problems, prefix(at, placementProblems(t.Where, t.OS))...)
 		if t.Server == nil {
-			if t.UseWhen != "" || len(t.Env) > 0 || t.HeadersHelper != "" {
-				problems = append(problems, at+": use_when, env and headers_helper need a server")
+			if t.UseWhen != "" || len(t.Roles) > 0 || len(t.Projects) > 0 || len(t.Env) > 0 || t.HeadersHelper != "" {
+				problems = append(problems, at+": use_when, roles, projects, env and headers_helper need a server")
 			}
 			continue
 		}
+		servers[t.Name] = true
 		problems = append(problems, prefix(at, serverProblems(t.entry(), t.Version))...)
 	}
 
@@ -304,10 +323,10 @@ func (c *Catalog) Validate() error {
 		switch {
 		case e.Name == "":
 			problems = append(problems, fmt.Sprintf("mcp[%d]: name required", i))
-		case seen[e.Name]:
-			problems = append(problems, fmt.Sprintf("%s: name already used in toolchain or mcp", at))
+		case servers[e.Name]:
+			problems = append(problems, fmt.Sprintf("%s: another server already uses this name", at))
 		default:
-			seen[e.Name] = true
+			servers[e.Name] = true
 		}
 		problems = append(problems, prefix(at, placementProblems(e.Where, e.OS))...)
 		if e.Server == nil {
@@ -326,6 +345,21 @@ func (c *Catalog) Validate() error {
 func prefix(at string, problems []string) []string {
 	for i, p := range problems {
 		problems[i] = at + ": " + p
+	}
+	return problems
+}
+
+func scopeProblems(roles, projects []string) []string {
+	var problems []string
+	for _, r := range roles {
+		if !entryNamePattern.MatchString(r) {
+			problems = append(problems, fmt.Sprintf("role %q may use only letters, digits, - and _", r))
+		}
+	}
+	for _, p := range projects {
+		if p == "" || path.IsAbs(p) || path.Clean(p) != p || p == ".." || strings.HasPrefix(p, "../") {
+			problems = append(problems, fmt.Sprintf("project %q must be a clean relative path inside the code root", p))
+		}
 	}
 	return problems
 }
@@ -352,7 +386,7 @@ func placementProblems(where, goos []string) []string {
 // whose versions are not pinned by a tool.
 func serverProblems(e Entry, toolVersion string) []string {
 	s := e.Server
-	var problems []string
+	problems := scopeProblems(e.Roles, e.Projects)
 	if !entryNamePattern.MatchString(e.Name) {
 		problems = append(problems, fmt.Sprintf("name %q may only use letters, digits, - and _ when it has a server", e.Name))
 	}
