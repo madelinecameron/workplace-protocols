@@ -1,58 +1,51 @@
-# Example fleet contract, annotated with MCP endpoints.
+# Example workplace-protocols.yaml.
 #
-# Put this at ~/.workplace-protocols/workplace-protocols.yaml on the node
-# carrying your closet tag (discovery.DefaultRemotePath), then edit it.
-# discovery.Resolve finds that node by tag and reads the file over SSH.
+# Put it at ~/.workplace-protocols/workplace-protocols.yaml on each machine, or
+# point $WORKPLACE_PROTOCOLS_FILE at it. Only `tailnet` is required. Your own
+# tools can add top-level sections and parse them from discovery.Manifest.Raw;
+# readers ignore sections they do not know.
 #
-# A tool's `server:` block is an MCP Registry server.json, written in YAML:
-# https://github.com/modelcontextprotocol/registry/tree/main/docs/reference/server-json
-# Without one, a tool is still installed and its version still diffed, but no
-# agent finds it. With one, `tools.Resolve` joins this catalog to live tailnet
-# status and `tools.Config` renders an MCP client configuration.
-#
-# Declaring an endpoint here grants no authority. It says where a server is,
-# not what a caller may do with it. Consumers that need a safety property —
-# the `sources` package, for instance — still name each tool in their own
-# allowlist and still require the server to declare `readOnlyHint=true` on it.
+# The file holds no secrets. Where a server needs a token, the entry's `env:`
+# names the environment variable that holds it, and the MCP client reads that
+# variable when it starts the server.
 
+# Your tailnet's MagicDNS suffix.
 tailnet: example.ts.net
 
-closet:
-  host: server
-  tag: tag:server
+# Things on your network that your tools find by name. Agents do not connect
+# to these; MCP servers go under `mcp` or a tool's `server`.
+services:
+  - name: hub
+    url: ssh://git@server.example.ts.net/srv/hub.git
+  - name: postgres
+    url: postgres://server.example.ts.net:5432/app
+    tags: [tag:server]
+    parameters:
+      sslmode: disable
 
-hub:
-  remote: ssh://fleet@server.example.ts.net/opt/fleet/fleet-hub.git
-
-mirror:
-  host: you@server.example.ts.net
-  dir: /opt/fleet/fleet-mirrors
-
-registry:
-  remote: ssh://fleet@server.example.ts.net/opt/fleet/registry.git
-  path: ~/registry
-
+# The tools you build and install, read by the `tools` package. Each tool's
+# optional `server:` block is a standard MCP Registry server.json written in
+# YAML: https://github.com/modelcontextprotocol/registry/tree/main/docs/reference/server-json
 toolchain:
-  channel: stable
   tools:
-    # ---- local servers -----------------------------------------------------
-    # A package with registryType `fleet` is a binary the fleet installs onto
-    # PATH. It runs as a stdio subprocess on the calling machine, and its
-    # identifier is the command. `server.version` must match the tool version
-    # (a leading "v" is ignored).
-    #
-    # Leave `where` off a tool you want every agent to call. A `where` tag on
-    # a local server means it only resolves on nodes carrying that tag —
-    # correct for something that must run beside its state, and a silent
-    # missing endpoint everywhere else.
-
+    # registryType `fleet` means a command you install yourself. It runs as a
+    # stdio subprocess on the calling machine, and `identifier` is the command
+    # on PATH. `server.version` must match the tool version (a leading "v" is
+    # ignored).
     - name: tracker
       version: v0.2.6
+      repo: example/tracker
+      # role, build, install_cmd and sha256 are hints for whatever installs
+      # your tools. This library stores them and does nothing with them.
       role: agent
       install_cmd: "tracker daemon --install"
+      sha256:
+        darwin-arm64: 4f2c0e4c3d1e6f0b8a9d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f
+        linux-amd64: 9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b
+      use_when: "Which machine holds a repository, and what is uncommitted where."
       server:
         name: io.github.example/tracker
-        description: Workstation and repository state across the fleet
+        description: Workstation and repository state
         version: 0.2.6
         packages:
           - registryType: fleet
@@ -61,61 +54,67 @@ toolchain:
             packageArguments:
               - {type: positional, value: mcp}
 
+    # A remote whose entry has a `where` tag is served by the first online node
+    # carrying that tag, and {host} becomes that node's MagicDNS name. If no
+    # such node is online, Resolve reports it as unreachable.
     - name: deployer
       version: v0.1.9
+      where: [tag:server]
       server:
         name: io.github.example/deployer
         description: Services, deployments and their health
         version: 0.1.9
-        packages:
-          - registryType: fleet
-            identifier: deployer
-            transport: {type: stdio}
-            packageArguments:
-              - {type: positional, value: mcp}
-
-    - name: search-mcp
-      version: v0.1.0
-      server:
-        name: io.github.example/search
-        description: Code search across every indexed repository
-        version: 0.1.0
-        packages:
-          - registryType: fleet
-            identifier: search-mcp
-            transport: {type: stdio}
-
-    # ---- remote servers ----------------------------------------------------
-    # A remote is a long-running streamable-http server on the first online
-    # node carrying the tool's `where` tag. {host} in the url is filled with
-    # that node's MagicDNS name. A tool with no reachable node resolves to an
-    # explicit unreachable report, never a silent drop.
-
-    - name: mailbox
-      version: v0.1.4
-      role: agent
-      where: [tag:server]
-      server:
-        name: io.github.example/mailbox
-        description: Threaded mail between agents and people
-        version: 0.1.4
         remotes:
           - type: streamable-http
-            url: http://{host}:8788/mcp
-            variables:
-              host:
-                description: MagicDNS name of the node carrying tag:server
-                isRequired: true
+            url: http://{host}:8787/mcp
 
-    # ---- catalog-only tools ------------------------------------------------
-    # No `server:`: the fleet installs and version-diffs these, but agents
-    # invoke them as CLIs or they run headless on a timer.
-
+    # A tool without a server is a CLI or background job that agents do not
+    # call. It stays in the list so its version is recorded.
     - name: importer
       version: v0.1.2
       build: ./cmd/importer
       where: [tag:server]
 
-    - name: reports
-      version: v0.1.1
-      where: [tag:server]
+# Other MCP servers agents should get: ones someone else deploys, public
+# remote servers, and packages run with npx or uvx.
+mcp:
+  # A fixed URL needs no `where`. {token} is not in the file: `env:` maps it to
+  # the MAILBOX_TOKEN environment variable.
+  - name: mailbox
+    use_when: "Messages between agents. Reply to a thread rather than starting a new one."
+    env: {token: MAILBOX_TOKEN}
+    server:
+      name: io.github.example/mailbox
+      description: Threaded mail between agents and people
+      version: 0.9.0
+      remotes:
+        - type: streamable-http
+          url: https://mailbox.example.ts.net/mcp
+          headers:
+            - {name: Authorization, value: "Bearer {token}", isSecret: true}
+
+  # npm packages run as `npx -y <identifier>@<version>`, and pypi packages as
+  # `uvx <identifier>@<version>`.
+  - name: playwright
+    use_when: "Scripted browser automation in a clean browser."
+    server:
+      name: com.microsoft/playwright-mcp
+      description: Browser automation
+      version: 0.0.41
+      packages:
+        - registryType: npm
+          identifier: "@playwright/mcp"
+          version: 0.0.41
+          transport: {type: stdio}
+
+  # `os` limits a server to some operating systems.
+  - name: xcode
+    os: [darwin]
+    server:
+      name: com.example/xcode
+      description: iOS and macOS builds
+      version: 1.0.0
+      packages:
+        - registryType: fleet
+          identifier: xcode-mcp
+          transport: {type: stdio}

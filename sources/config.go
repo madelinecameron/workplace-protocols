@@ -22,7 +22,7 @@ const (
 	TransportHTTP Transport = "http"
 )
 
-// TrustBasis records why the plane is willing to believe a tool only reads.
+// TrustBasis records why this package is willing to believe a tool only reads.
 type TrustBasis string
 
 const (
@@ -36,7 +36,7 @@ const (
 )
 
 // ReservedID is the one server id a config may not use. Exposed tool names are
-// namespaced under it, so a server claiming it could shadow the plane itself.
+// namespaced under it, so a server claiming it could pose as this package.
 const ReservedID = "sources"
 
 var (
@@ -45,7 +45,7 @@ var (
 	headerPattern = regexp.MustCompile("^[!#$%&'*+\\-.^_`|~0-9A-Za-z]+$")
 )
 
-// Config is the whole operator-reviewable description of what the plane may
+// Config is the whole operator-reviewable description of what this package may
 // reach. It is meant to be committed, so it names environment variables rather
 // than holding any secret itself.
 type Config struct {

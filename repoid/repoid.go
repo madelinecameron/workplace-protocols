@@ -3,10 +3,9 @@
 // URL, so a project cloned over ssh on one machine and https on another — or at
 // different paths — resolves to one id.
 //
-// It is shared, not copied, because correlation only works if every tool
-// computes a byte-identical id. One tool may key its state by RepoID while
-// another looks a service's repo up by the same id. A drift in this function
-// silently breaks that join.
+// Every tool that keys data by repository should use this package rather than
+// its own copy: if one tool stores by RepoID and another looks up by it, any
+// difference between their copies silently breaks the lookup.
 package repoid
 
 import (
@@ -30,8 +29,8 @@ func RepoID(remote, absPath string) string {
 	return idhash.Sum("remote:" + CanonicalRemote(remote))
 }
 
-// PathID identifies one working tree on one machine. It keys state documents so
-// that several clones or worktrees of the same project never collide.
+// PathID identifies one working tree on one machine, so several clones or
+// worktrees of the same repository get different ids.
 func PathID(machine, absPath string) string {
 	return idhash.Sum("wt:" + machine + ":" + absPath)
 }

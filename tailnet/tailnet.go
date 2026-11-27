@@ -2,9 +2,8 @@
 // `tailscale status --json` into a small, dependency-free inventory of the
 // reachable nodes, their tags, and MagicDNS names.
 //
-// Tools built on Tailscale use it to read the network the same way: a service
-// registry reconciles against it, and discovery resolves roles by tag.
-// Tailscale is the discovery root; this package is how everything reads it.
+// The other packages use it to find nodes by ACL tag, so a node's job is set in
+// Tailscale rather than in a config file.
 package tailnet
 
 import (
@@ -125,9 +124,7 @@ func (s *Status) Lookup(name string) *Node {
 	return nil
 }
 
-// ByTag returns every node carrying the given ACL tag (Self included). It is
-// the primitive discovery uses to resolve a role — e.g. finding the closet box
-// by `tag:closet` — without any central service.
+// ByTag returns every node carrying the given ACL tag, Self included.
 func (s *Status) ByTag(tag string) []*Node {
 	var out []*Node
 	for _, n := range s.all() {

@@ -1,137 +1,177 @@
-// Package tools is the discovery layer for a fleet's own tools: which tool
-// exists, at which version, on which host, and how an agent reaches its MCP
-// endpoint.
+// Package tools reads the `toolchain` and `mcp` sections of
+// workplace-protocols.yaml and turns them into MCP client configuration.
 //
-// Without it, every agent has each MCP server registered by hand on every
-// machine, and those registrations drift apart. Here the `toolchain` block of
-// workplace-protocols.yaml is the single source. A tool's MCP endpoint is
-// declared as a standard MCP Registry server.json under `server`; Resolve
-// turns that plus a tailnet status into concrete endpoints (honouring the
-// `where` tags that decide which boxes run which daemon), and Config renders
-// them as an MCP client configuration. No service is involved.
+// `toolchain` lists the tools you build and install, with the version of
+// each. `mcp` lists the other MCP servers agents should get: servers someone
+// else deploys, public remote servers, and packages run with npx or uvx. A
+// tool with an MCP server declares it inline under `server`, so its version is
+// written once. Every server is a standard MCP Registry server.json.
 //
-// It does not do allowlisting or audit. Those need a gateway, which would be a
-// running service everything depends on. Every caller on this plane is
-// trusted; when that stops being true, this package still names what a gateway
-// would front.
+// Resolve works out which servers this machine gets and how it reaches each,
+// and Config and Codex render the result for Claude Code and Codex.
+//
+// Secrets never go in the file. A `{name}` in a URL, header, argument or
+// environment value is filled from the server.json variable of that name,
+// from {host}, or from the environment variable the entry's `env:` maps it
+// to. The renderers emit a reference to that environment variable, and the
+// MCP client reads it when it starts the server.
+//
+// Declaring a server grants no authority. It says where a server is and how
+// to connect, not what a caller may do with it.
 package tools
 
 import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
 	apiv0 "github.com/modelcontextprotocol/registry/pkg/api/v0"
 	"github.com/modelcontextprotocol/registry/pkg/model"
 	"gopkg.in/yaml.v3"
-
-	"github.com/madelinecameron/workplace-protocols/tailnet"
 )
 
-// DefaultChannel is the toolchain channel a manifest tracks when unset.
+// DefaultChannel is the release channel ParseCatalog sets when the manifest
+// names none. This package only records it; an installer that reads the
+// catalog can use it to pick builds.
 const DefaultChannel = "stable"
 
-// RegistryTypeFleet is the server.json package registryType for a binary the
-// fleet installs onto PATH itself. The package identifier is the command to
-// run. No standard registryType covers that case, so public registries will
-// not accept it.
+// RegistryTypeFleet is the server.json package registryType for a command you
+// install on your machines yourself, by any means. The package identifier is
+// the command, and it must be on PATH. No standard registryType covers that
+// case, so public MCP registries will not accept these entries.
 const RegistryTypeFleet = "fleet"
 
 // HostVariable is the remote URL variable Resolve fills with the name of the
-// online node carrying one of the tool's `where` tags, as in
+// online node carrying one of the entry's `where` tags, as in
 // "http://{host}:8788/mcp".
 const HostVariable = "host"
 
 var (
 	serverNamePattern  = regexp.MustCompile(`^[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+$`)
 	urlVariablePattern = regexp.MustCompile(`\{([a-zA-Z_][a-zA-Z0-9_]*)\}`)
+	entryNamePattern   = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+	variablePattern    = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+	envNamePattern     = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
+	headerNamePattern  = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 )
 
-// Catalog is the parsed `toolchain` block of workplace-protocols.yaml — the fleet's
-// contract for which tools exist at which version.
+var knownOS = []string{"darwin", "freebsd", "linux", "netbsd", "openbsd", "windows"}
+
+// Catalog is the parsed `toolchain` section plus the top-level `mcp` list.
 type Catalog struct {
-	Channel string `yaml:"channel,omitempty" json:"channel,omitempty"`
-	Tools   []Tool `yaml:"tools" json:"tools"`
+	Channel string  `yaml:"channel,omitempty" json:"channel,omitempty"`
+	Tools   []Tool  `yaml:"tools" json:"tools"`
+	MCP     []Entry `yaml:"-" json:"mcp,omitempty"`
 }
 
-// Tool is one internal tool: a pinned version, optionally a daemon role, the
-// tags constraining where it runs, and optionally the MCP server it exposes.
+// Tool is one of your tools: its pinned version, the tags of the nodes it runs
+// on, and optionally the MCP server it exposes.
 type Tool struct {
-	Name    string `yaml:"name" json:"name"`
+	Name string `yaml:"name" json:"name"`
+	// Version is the version you expect installed. An installer can compare it
+	// with what a machine has.
 	Version string `yaml:"version" json:"version"`
-	Role    string `yaml:"role,omitempty" json:"role,omitempty"`
+	// Repo is where the source lives, such as owner/name on GitHub.
+	Repo string `yaml:"repo,omitempty" json:"repo,omitempty"`
 
-	// Build is the main-package path the publisher compiles, e.g.
-	// "./cmd/importer". Empty lets the publisher fall back to
-	// ./cmd/<name> and then the module root — which is right until a repo's
-	// binary is named differently from the repo.
-	Build string `yaml:"build,omitempty" json:"build,omitempty"`
-
-	// InstallCmd is run once, idempotently, for a tool that installs and
-	// supervises its own unit. A tool sets this or it gets a unit written for
-	// it; setting both means two things believe they own the daemon.
-	InstallCmd string `yaml:"install_cmd,omitempty" json:"install_cmd,omitempty"`
-
+	// Where limits the tool to nodes carrying one of these ACL tags. Empty
+	// means every machine.
 	Where []string `yaml:"where,omitempty" json:"where,omitempty"`
+	// OS limits the tool to these operating systems, as Go names them
+	// (darwin, linux, windows). Empty means every one.
+	OS []string `yaml:"os,omitempty" json:"os,omitempty"`
 
 	// Server is the tool's MCP server as an MCP Registry server.json. A tool
-	// without one is a CLI the fleet installs but no agent calls directly; it
-	// stays in the catalog so its version can still be diffed against what is
-	// installed.
+	// without one is a CLI or a background job that agents do not call
+	// directly; it stays in the catalog so its version is still recorded.
 	Server *apiv0.ServerJSON `yaml:"-" json:"server,omitempty"`
+	// UseWhen, Env and HeadersHelper apply to Server, as on an Entry.
+	UseWhen       string            `yaml:"use_when,omitempty" json:"use_when,omitempty"`
+	Env           map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
+	HeadersHelper string            `yaml:"headers_helper,omitempty" json:"headers_helper,omitempty"`
+
+	// Role, Build, InstallCmd and SHA256 are hints for whatever installs your
+	// tools. This package stores them and acts on none of them.
+
+	// Role is a free-form label, such as agent or daemon.
+	Role string `yaml:"role,omitempty" json:"role,omitempty"`
+	// Build is the main package to compile, such as ./cmd/importer.
+	Build string `yaml:"build,omitempty" json:"build,omitempty"`
+	// InstallCmd is a command the tool provides to install itself, such as
+	// "tracker daemon --install".
+	InstallCmd string `yaml:"install_cmd,omitempty" json:"install_cmd,omitempty"`
+	// SHA256 maps a platform, such as darwin-arm64, to the expected checksum
+	// of that build.
+	SHA256 map[string]string `yaml:"sha256,omitempty" json:"sha256,omitempty"`
 }
 
-// UnmarshalYAML decodes a tool, rejecting fields it does not define, and reads
-// `server` with server.json's own JSON field names, rejecting fields
-// server.json does not define. A server without a `$schema` gets the current
-// registry schema URL.
+// Entry is an MCP server agents should get that is not one of your tools.
+type Entry struct {
+	Name string `yaml:"name" json:"name"`
+	// UseWhen tells agents when to reach for this server. server.json's own
+	// description is capped at 100 characters; this is not.
+	UseWhen string `yaml:"use_when,omitempty" json:"use_when,omitempty"`
+	// Where, on a remote, is the tags of the nodes serving it, and {host} in
+	// its URL becomes the first online one. On a package it limits which
+	// machines run it. Empty means a fixed URL, or every machine.
+	Where []string `yaml:"where,omitempty" json:"where,omitempty"`
+	// OS limits the server to these operating systems.
+	OS []string `yaml:"os,omitempty" json:"os,omitempty"`
+	// Env maps a {variable} used in the server block to the environment
+	// variable that holds its value.
+	Env map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
+	// HeadersHelper is a command that prints extra request headers for a
+	// remote. Only clients that support one get it.
+	HeadersHelper string            `yaml:"headers_helper,omitempty" json:"headers_helper,omitempty"`
+	Server        *apiv0.ServerJSON `yaml:"-" json:"server"`
+}
+
+// UnmarshalYAML decodes a tool, rejecting fields it does not define.
 func (t *Tool) UnmarshalYAML(node *yaml.Node) error {
 	type plain Tool
-	var raw struct {
-		Tool   plain          `yaml:",inline"`
-		Server map[string]any `yaml:"server"`
-	}
-	if node.Kind == yaml.MappingNode {
-		for i := 0; i < len(node.Content); i += 2 {
-			key := node.Content[i]
-			if !toolFields[key.Value] {
-				return fmt.Errorf("line %d: tool entry has unrecognized field %q", key.Line, key.Value)
-			}
-		}
-	}
-	if err := node.Decode(&raw); err != nil {
+	var p plain
+	raw, err := decodeStrict(node, "tool", toolFields, &p)
+	if err != nil {
 		return err
 	}
-	*t = Tool(raw.Tool)
-	if raw.Server == nil {
-		return nil
-	}
-	data, err := json.Marshal(raw.Server)
+	*t = Tool(p)
+	t.Server, err = parseServer(raw)
 	if err != nil {
 		return fmt.Errorf("tool %s: server: %w", t.Name, err)
 	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	var server apiv0.ServerJSON
-	if err := dec.Decode(&server); err != nil {
-		return fmt.Errorf("tool %s: server: %w", t.Name, err)
-	}
-	if server.Schema == "" {
-		server.Schema = model.CurrentSchemaURL
-	}
-	t.Server = &server
 	return nil
 }
 
-// toolFields is every key a tool entry may carry: Tool's yaml names plus
-// "server".
-var toolFields = func() map[string]bool {
+// UnmarshalYAML decodes an mcp entry, rejecting fields it does not define.
+func (e *Entry) UnmarshalYAML(node *yaml.Node) error {
+	type plain Entry
+	var p plain
+	raw, err := decodeStrict(node, "mcp", entryFields, &p)
+	if err != nil {
+		return err
+	}
+	*e = Entry(p)
+	e.Server, err = parseServer(raw)
+	if err != nil {
+		return fmt.Errorf("mcp %s: server: %w", e.Name, err)
+	}
+	return nil
+}
+
+var (
+	toolFields  = yamlFields[Tool]()
+	entryFields = yamlFields[Entry]()
+)
+
+func yamlFields[T any]() map[string]bool {
 	fields := map[string]bool{"server": true}
-	typ := reflect.TypeFor[Tool]()
+	typ := reflect.TypeFor[T]()
 	for i := range typ.NumField() {
 		name, _, _ := strings.Cut(typ.Field(i).Tag.Get("yaml"), ",")
 		if name != "" && name != "-" {
@@ -139,70 +179,142 @@ var toolFields = func() map[string]bool {
 		}
 	}
 	return fields
-}()
-
-// Endpoint is a resolved way to reach one tool: the catalog entry joined with
-// the concrete node serving it.
-type Endpoint struct {
-	Tool Tool
-	// Node is the tailnet node serving an HTTP endpoint. Nil for stdio, which
-	// runs on the caller's own machine.
-	Node *tailnet.Node
-	// URL is set for an HTTP endpoint.
-	URL string
-	// Command and Args are set for a stdio endpoint.
-	Command string
-	Args    []string
 }
 
-// ParseCatalog decodes the `toolchain` block out of workplace-protocols.yaml bytes. It reads
-// the whole manifest and keeps only the toolchain, so callers can pass the same
-// bytes discovery.Parse gets.
+// decodeStrict decodes node into dst after checking every key is in fields,
+// and returns the raw `server` mapping for parseServer.
+func decodeStrict(node *yaml.Node, kind string, fields map[string]bool, dst any) (map[string]any, error) {
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i < len(node.Content); i += 2 {
+			key := node.Content[i]
+			if !fields[key.Value] {
+				return nil, fmt.Errorf("line %d: %s entry has unrecognized field %q", key.Line, kind, key.Value)
+			}
+		}
+	}
+	if err := node.Decode(dst); err != nil {
+		return nil, err
+	}
+	var raw struct {
+		Server map[string]any `yaml:"server"`
+	}
+	if err := node.Decode(&raw); err != nil {
+		return nil, err
+	}
+	return raw.Server, nil
+}
+
+// parseServer reads a server block with server.json's own JSON field names,
+// rejecting fields server.json does not define. A server without a `$schema`
+// gets the current registry schema URL.
+func parseServer(raw map[string]any) (*apiv0.ServerJSON, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var server apiv0.ServerJSON
+	if err := dec.Decode(&server); err != nil {
+		return nil, err
+	}
+	if server.Schema == "" {
+		server.Schema = model.CurrentSchemaURL
+	}
+	return &server, nil
+}
+
+// ParseCatalog decodes the `toolchain` and `mcp` sections out of
+// workplace-protocols.yaml bytes and ignores the rest, so it can take
+// discovery.Manifest.Raw.
 func ParseCatalog(data []byte) (*Catalog, error) {
 	var wrapper struct {
 		Toolchain Catalog `yaml:"toolchain"`
+		MCP       []Entry `yaml:"mcp"`
 	}
 	if err := yaml.Unmarshal(data, &wrapper); err != nil {
 		return nil, fmt.Errorf("parse toolchain: %w", err)
 	}
 	c := wrapper.Toolchain
+	c.MCP = wrapper.MCP
 	if c.Channel == "" {
 		c.Channel = DefaultChannel
 	}
 	return &c, nil
 }
 
-// Validate reports every problem at once rather than the first, because these
-// are edited by hand and a manifest with three mistakes should not take three
-// runs to fix.
+func (t Tool) entry() Entry {
+	return Entry{
+		Name:          t.Name,
+		UseWhen:       t.UseWhen,
+		Where:         t.Where,
+		OS:            t.OS,
+		Env:           t.Env,
+		HeadersHelper: t.HeadersHelper,
+		Server:        t.Server,
+	}
+}
+
+// Entries returns every MCP server in the catalog: the tools that declare a
+// server, then the `mcp` list.
+func (c *Catalog) Entries() []Entry {
+	var out []Entry
+	for _, t := range c.Tools {
+		if t.Server != nil {
+			out = append(out, t.entry())
+		}
+	}
+	return append(out, c.MCP...)
+}
+
+// Validate reports every problem at once rather than stopping at the first,
+// since the file is edited by hand.
 func (c *Catalog) Validate() error {
 	var problems []string
-	seen := make(map[string]bool, len(c.Tools))
+	seen := make(map[string]bool, len(c.Tools)+len(c.MCP))
 
 	for i, t := range c.Tools {
+		at := fmt.Sprintf("tools[%d] (%s)", i, t.Name)
 		switch {
 		case t.Name == "":
 			problems = append(problems, fmt.Sprintf("tools[%d]: name required", i))
 		case seen[t.Name]:
-			// Two entries for one name make "which version is installed?"
-			// unanswerable, which is the question the catalog exists for.
-			problems = append(problems, fmt.Sprintf("tools[%d]: %q listed twice", i, t.Name))
+			problems = append(problems, fmt.Sprintf("%s: listed twice", at))
 		default:
 			seen[t.Name] = true
 		}
 		if t.Version == "" {
-			problems = append(problems, fmt.Sprintf("tools[%d] (%s): version required — an unpinned tool cannot be diffed against what is installed", i, t.Name))
+			problems = append(problems, at+": version required")
 		}
-		for _, w := range t.Where {
-			if !strings.HasPrefix(w, "tag:") {
-				problems = append(problems, fmt.Sprintf("tools[%d] (%s): where %q must be an ACL tag (tag:...)", i, t.Name, w))
+		problems = append(problems, prefix(at, placementProblems(t.Where, t.OS))...)
+		if t.Server == nil {
+			if t.UseWhen != "" || len(t.Env) > 0 || t.HeadersHelper != "" {
+				problems = append(problems, at+": use_when, env and headers_helper need a server")
 			}
+			continue
 		}
-		if t.Server != nil {
-			for _, p := range serverProblems(t) {
-				problems = append(problems, fmt.Sprintf("tools[%d] (%s): server: %s", i, t.Name, p))
-			}
+		problems = append(problems, prefix(at, serverProblems(t.entry(), t.Version))...)
+	}
+
+	for i, e := range c.MCP {
+		at := fmt.Sprintf("mcp[%d] (%s)", i, e.Name)
+		switch {
+		case e.Name == "":
+			problems = append(problems, fmt.Sprintf("mcp[%d]: name required", i))
+		case seen[e.Name]:
+			problems = append(problems, fmt.Sprintf("%s: name already used in toolchain or mcp", at))
+		default:
+			seen[e.Name] = true
 		}
+		problems = append(problems, prefix(at, placementProblems(e.Where, e.OS))...)
+		if e.Server == nil {
+			problems = append(problems, at+": server required")
+			continue
+		}
+		problems = append(problems, prefix(at, serverProblems(e, ""))...)
 	}
 
 	if len(problems) > 0 {
@@ -211,93 +323,61 @@ func (c *Catalog) Validate() error {
 	return nil
 }
 
-// serverProblems checks the server.json fields the registry schema requires
-// and the subset of server.json that Resolve can turn into an endpoint.
-// Anything Resolve would otherwise drop is rejected, so a declared setting is
-// never silently ignored.
-func serverProblems(t Tool) []string {
-	s := t.Server
+func prefix(at string, problems []string) []string {
+	for i, p := range problems {
+		problems[i] = at + ": " + p
+	}
+	return problems
+}
+
+func placementProblems(where, goos []string) []string {
 	var problems []string
+	for _, w := range where {
+		if !strings.HasPrefix(w, "tag:") {
+			problems = append(problems, fmt.Sprintf("where %q must be an ACL tag (tag:...)", w))
+		}
+	}
+	for _, o := range goos {
+		if !slices.Contains(knownOS, o) {
+			problems = append(problems, fmt.Sprintf("os %q must be one of %s", o, strings.Join(knownOS, ", ")))
+		}
+	}
+	return problems
+}
+
+// serverProblems checks the server.json fields the registry schema requires,
+// the entry's own fields, and that build can turn the server into an
+// endpoint. Anything build would otherwise drop is rejected, so a declared
+// setting is never silently ignored. toolVersion is empty for mcp entries,
+// whose versions are not pinned by a tool.
+func serverProblems(e Entry, toolVersion string) []string {
+	s := e.Server
+	var problems []string
+	if !entryNamePattern.MatchString(e.Name) {
+		problems = append(problems, fmt.Sprintf("name %q may only use letters, digits, - and _ when it has a server", e.Name))
+	}
 	if len(s.Name) < 3 || len(s.Name) > 200 || !serverNamePattern.MatchString(s.Name) {
-		problems = append(problems, fmt.Sprintf("name %q must be reverse-DNS with one slash, like io.github.owner/server", s.Name))
+		problems = append(problems, fmt.Sprintf("server: name %q must be reverse-DNS with one slash, like io.github.owner/server", s.Name))
 	}
 	if s.Description == "" || len(s.Description) > 100 {
-		problems = append(problems, "description must be 1 to 100 characters")
+		problems = append(problems, "server: description must be 1 to 100 characters")
 	}
-	if strings.TrimPrefix(s.Version, "v") != strings.TrimPrefix(t.Version, "v") {
-		problems = append(problems, fmt.Sprintf("version %q does not match the tool version %q", s.Version, t.Version))
+	if s.Version == "" {
+		problems = append(problems, "server: version required")
 	}
-
-	switch {
-	case len(s.Packages) > 0 && len(s.Remotes) > 0:
-		problems = append(problems, "declare packages or remotes, not both")
-	case len(s.Packages) > 1 || len(s.Remotes) > 1:
-		problems = append(problems, "declare exactly one package or remote")
-	case len(s.Packages) == 1:
-		problems = append(problems, packageProblems(s.Packages[0])...)
-	case len(s.Remotes) == 1:
-		problems = append(problems, remoteProblems(s.Remotes[0], t.Where)...)
-	default:
-		problems = append(problems, "declares no package or remote")
+	if toolVersion != "" && strings.TrimPrefix(s.Version, "v") != strings.TrimPrefix(toolVersion, "v") {
+		problems = append(problems, fmt.Sprintf("server: version %q does not match the tool version %q", s.Version, toolVersion))
 	}
-	return problems
-}
-
-func packageProblems(p model.Package) []string {
-	var problems []string
-	if p.RegistryType != RegistryTypeFleet {
-		problems = append(problems, fmt.Sprintf("package registryType %q is not supported; use %q", p.RegistryType, RegistryTypeFleet))
-	}
-	if p.Identifier == "" {
-		problems = append(problems, "package identifier (the command to run) is required")
-	}
-	if p.Transport.Type != model.TransportTypeStdio {
-		problems = append(problems, fmt.Sprintf("package transport %q is not supported; use %q", p.Transport.Type, model.TransportTypeStdio))
-	}
-	if len(p.RuntimeArguments) > 0 || len(p.EnvironmentVariables) > 0 || p.RunTimeHint != "" {
-		problems = append(problems, "runtimeHint, runtimeArguments and environmentVariables are not supported")
-	}
-	for _, arg := range p.PackageArguments {
-		switch arg.Type {
-		case model.ArgumentTypePositional:
-			if arg.Value == "" {
-				problems = append(problems, "positional package arguments need a value")
-			}
-		case model.ArgumentTypeNamed:
-			if arg.Name == "" {
-				problems = append(problems, "named package arguments need a name")
-			}
-		default:
-			problems = append(problems, fmt.Sprintf("package argument type %q is unknown", arg.Type))
+	for _, variable := range slices.Sorted(maps.Keys(e.Env)) {
+		if !variablePattern.MatchString(variable) {
+			problems = append(problems, fmt.Sprintf("env: %q is not a valid variable name", variable))
+		}
+		if name := e.Env[variable]; !envNamePattern.MatchString(name) {
+			problems = append(problems, fmt.Sprintf("env: %s maps to %q, which is not an UPPER_SNAKE environment variable name", variable, name))
 		}
 	}
-	return problems
-}
-
-func remoteProblems(r model.Transport, where []string) []string {
-	var problems []string
-	if r.Type != model.TransportTypeStreamableHTTP {
-		problems = append(problems, fmt.Sprintf("remote type %q is not supported; use %q", r.Type, model.TransportTypeStreamableHTTP))
-	}
-	if len(r.Headers) > 0 {
-		problems = append(problems, "remote headers are not supported")
-	}
-	if !strings.Contains(r.URL, "{"+HostVariable+"}") {
-		problems = append(problems, fmt.Sprintf("remote url %q must contain {%s}, filled from the where tag", r.URL, HostVariable))
-	}
-	if len(where) == 0 {
-		problems = append(problems, "a remote needs a where tag naming the node that serves it")
-	}
-	for _, m := range urlVariablePattern.FindAllStringSubmatch(r.URL, -1) {
-		name := m[1]
-		if name == HostVariable {
-			continue
-		}
-		if v, ok := r.Variables[name]; !ok || v.Value == "" && v.Default == "" {
-			problems = append(problems, fmt.Sprintf("remote url variable {%s} needs a value or default", name))
-		}
-	}
-	return problems
+	_, buildProblems := build(e, "{"+HostVariable+"}", len(e.Where) > 0)
+	return append(problems, prefix("server", buildProblems)...)
 }
 
 // Lookup finds a tool by name.
@@ -318,155 +398,4 @@ func (c *Catalog) Names() []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// Resolve turns the catalog into the endpoints a caller can actually reach.
-// Call Validate first; Resolve reports tools it cannot use as unreachable
-// rather than repeating every validation rule.
-//
-// Tools with no server are skipped: they are installed, not called. A remote
-// is resolved against the tailnet — it is served by the first online node
-// carrying one of its `where` tags, whose name fills {host}. A package
-// resolves locally and is skipped when `where` excludes this machine, because
-// the binary will not be installed here.
-//
-// st may be nil: packages still resolve, remotes are reported as unreachable.
-// That keeps a workstation with tailscale down from losing access to the
-// local plane.
-func Resolve(c *Catalog, st *tailnet.Status) ([]Endpoint, error) {
-	if c == nil {
-		return nil, fmt.Errorf("no catalog")
-	}
-	var (
-		out      []Endpoint
-		unreach  []string
-		selfTags []string
-	)
-	if st != nil && st.Self != nil {
-		selfTags = st.Self.Tags
-	}
-
-	for _, t := range c.Tools {
-		s := t.Server
-		switch {
-		case s == nil:
-			continue
-		case len(s.Remotes) > 0:
-			if len(t.Where) == 0 {
-				unreach = append(unreach, fmt.Sprintf("%s (remote declares no where tag)", t.Name))
-				continue
-			}
-			node := serveNode(st, t.Where)
-			if node == nil {
-				unreach = append(unreach, fmt.Sprintf("%s (no online node carries %s)", t.Name, strings.Join(t.Where, ", ")))
-				continue
-			}
-			host := node.DNSName
-			if host == "" {
-				host = node.Host
-			}
-			out = append(out, Endpoint{Tool: t, Node: node, URL: expandURL(s.Remotes[0], host)})
-		case len(s.Packages) > 0:
-			if !runsHere(t.Where, selfTags) {
-				continue
-			}
-			p := s.Packages[0]
-			out = append(out, Endpoint{Tool: t, Command: p.Identifier, Args: packageArgs(p.PackageArguments)})
-		default:
-			unreach = append(unreach, fmt.Sprintf("%s (server declares no package or remote)", t.Name))
-		}
-	}
-
-	sort.Slice(out, func(i, j int) bool { return out[i].Tool.Name < out[j].Tool.Name })
-	if len(unreach) > 0 {
-		// Partial results plus an error: a caller that wants everything can
-		// fail, and a caller that wants what it can get still has it. Silently
-		// dropping a tool is how registrations drift apart.
-		return out, fmt.Errorf("unreachable: %s", strings.Join(unreach, "; "))
-	}
-	return out, nil
-}
-
-// expandURL fills {host} and every other variable from its value or default.
-func expandURL(r model.Transport, host string) string {
-	return urlVariablePattern.ReplaceAllStringFunc(r.URL, func(match string) string {
-		name := match[1 : len(match)-1]
-		if name == HostVariable {
-			return host
-		}
-		if v := r.Variables[name]; v.Value != "" {
-			return v.Value
-		}
-		return r.Variables[name].Default
-	})
-}
-
-func packageArgs(args []model.Argument) []string {
-	var out []string
-	for _, arg := range args {
-		if arg.Type == model.ArgumentTypeNamed {
-			out = append(out, arg.Name)
-		}
-		if arg.Value != "" {
-			out = append(out, arg.Value)
-		}
-	}
-	return out
-}
-
-// serveNode picks the first online node carrying one of the `where` tags, in
-// tag order and then in tailnet order.
-func serveNode(st *tailnet.Status, where []string) *tailnet.Node {
-	if st == nil {
-		return nil
-	}
-	var candidates []*tailnet.Node
-	for _, tag := range where {
-		candidates = append(candidates, st.ByTag(tag)...)
-	}
-	for _, n := range candidates {
-		if n.Online {
-			return n
-		}
-	}
-	return nil
-}
-
-// runsHere reports whether a tool constrained to `where` is installed on a
-// machine carrying selfTags. An unconstrained tool runs everywhere.
-func runsHere(where, selfTags []string) bool {
-	if len(where) == 0 {
-		return true
-	}
-	for _, w := range where {
-		for _, t := range selfTags {
-			if w == t {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// Server is one entry in an MCP client configuration.
-type Server struct {
-	Command string   `json:"command,omitempty"`
-	Args    []string `json:"args,omitempty"`
-	Type    string   `json:"type,omitempty"`
-	URL     string   `json:"url,omitempty"`
-}
-
-// Config renders endpoints as the `mcpServers` map every MCP client accepts, so
-// an agent's registration is generated from the fleet contract instead of being
-// retyped against it. Marshal it as JSON under whatever key the client wants.
-func Config(endpoints []Endpoint) map[string]Server {
-	servers := make(map[string]Server, len(endpoints))
-	for _, e := range endpoints {
-		if e.URL != "" {
-			servers[e.Tool.Name] = Server{Type: "http", URL: e.URL}
-			continue
-		}
-		servers[e.Tool.Name] = Server{Command: e.Command, Args: e.Args}
-	}
-	return servers
 }

@@ -1,0 +1,18 @@
+{
+  "servers": [
+    {
+      "id": "deployer",
+      "command": "deployer",
+      "args": ["mcp"],
+      "env": ["DEPLOYER_CONFIG"],
+      "allow": ["deployer_overview", "deployer_service_status"]
+    },
+    {
+      "id": "metrics",
+      "transport": "http",
+      "url": "https://metrics.example.ts.net/mcp",
+      "headers": {"Authorization": "METRICS_MCP_AUTHORIZATION"},
+      "allow": ["metrics_query"]
+    }
+  ]
+}
