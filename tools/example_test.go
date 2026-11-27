@@ -83,7 +83,7 @@ func TestShippedExampleResolvesOnAHealthyTailnet(t *testing.T) {
 	self := &tailnet.Node{Host: "laptop", Tags: []string{"tag:workstation"}, Online: true}
 	server := &tailnet.Node{Host: "server", DNSName: "server.example.ts.net", Tags: []string{"tag:server"}, Online: true}
 
-	eps, err := resolve(c, &tailnet.Status{Self: self, Nodes: []*tailnet.Node{self, server}}, "darwin")
+	eps, err := resolve(c, &tailnet.Status{Self: self, Nodes: []*tailnet.Node{self, server}}, "darwin", "")
 	if err != nil {
 		t.Fatalf("Resolve on a healthy tailnet: %v", err)
 	}

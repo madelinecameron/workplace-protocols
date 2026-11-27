@@ -23,27 +23,64 @@ type Server struct {
 	HeadersHelper string            `json:"headersHelper,omitempty"`
 }
 
-// Config renders endpoints as an `mcpServers` map. Marshal it as JSON under
-// that key to get a .mcp.json file.
+// Config renders the endpoints that are not limited to projects as an
+// `mcpServers` map. Marshal it as JSON under that key to get a .mcp.json file.
+//
+// A remote with a headers helper gets only its literal headers: the helper
+// supplies the rest, so the environment variables those headers read need not
+// be set when Claude Code starts.
 func Config(endpoints []Endpoint) map[string]Server {
-	servers := make(map[string]Server, len(endpoints))
+	servers := map[string]Server{}
 	for _, e := range endpoints {
-		if e.Remote() {
-			servers[e.Name] = Server{
-				Type:          "http",
-				URL:           e.URL.String(),
-				Headers:       fieldMap(e.Headers),
-				HeadersHelper: e.HeadersHelper,
-			}
-			continue
+		if len(e.Projects) == 0 {
+			servers[e.Name] = claudeServer(e)
 		}
-		var args []string
-		for _, a := range e.Args {
-			args = append(args, a.String())
-		}
-		servers[e.Name] = Server{Command: e.Command, Args: args, Env: fieldMap(e.Env)}
 	}
 	return servers
+}
+
+// ProjectConfigs renders the endpoints limited to projects as one
+// `mcpServers` map per project directory.
+func ProjectConfigs(endpoints []Endpoint) map[string]map[string]Server {
+	out := map[string]map[string]Server{}
+	for _, e := range endpoints {
+		for _, p := range e.Projects {
+			if out[p] == nil {
+				out[p] = map[string]Server{}
+			}
+			out[p][e.Name] = claudeServer(e)
+		}
+	}
+	return out
+}
+
+// ForClaude returns the endpoint as Claude Code gets it: a remote with a
+// headers helper keeps only the headers that read no environment variable.
+func (e Endpoint) ForClaude() Endpoint {
+	if e.Remote() && e.HeadersHelper != "" {
+		e.Headers = slices.DeleteFunc(slices.Clone(e.Headers), func(h Field) bool {
+			_, ok := h.Value.Literal()
+			return !ok
+		})
+	}
+	return e
+}
+
+func claudeServer(e Endpoint) Server {
+	e = e.ForClaude()
+	if e.Remote() {
+		return Server{
+			Type:          "http",
+			URL:           e.URL.String(),
+			Headers:       fieldMap(e.Headers),
+			HeadersHelper: e.HeadersHelper,
+		}
+	}
+	var args []string
+	for _, a := range e.Args {
+		args = append(args, a.String())
+	}
+	return Server{Command: e.Command, Args: args, Env: fieldMap(e.Env)}
 }
 
 func fieldMap(fields []Field) map[string]string {
@@ -65,13 +102,17 @@ func fieldMap(fields []Field) map[string]string {
 // (env_http_headers), and a stdio server can inherit a variable of the same
 // name (env_vars). An endpoint that needs anything else is left out and named
 // in the returned error, alongside the TOML for the rest. Codex gets no
-// headers_helper.
+// headers_helper, and has no per-project servers, so endpoints limited to
+// projects are skipped.
 func Codex(endpoints []Endpoint) ([]byte, error) {
 	var (
 		out      bytes.Buffer
 		problems []string
 	)
 	for _, e := range endpoints {
+		if len(e.Projects) > 0 {
+			continue
+		}
 		table, err := codexTable(e)
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("%s: %v", e.Name, err))
