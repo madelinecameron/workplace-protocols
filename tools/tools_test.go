@@ -167,13 +167,49 @@ func TestValidateRejectsTheThingsThatMakeTheCatalogUseless(t *testing.T) {
 			server(header),
 			"no package or remote",
 		},
-		"public registry package": {
-			server(header + "        packages:\n          - {registryType: npm, identifier: c, transport: {type: stdio}}\n"),
-			`registryType "npm" is not supported`,
+		"unsupported registry type": {
+			server(header + "        packages:\n          - {registryType: cargo, identifier: c, transport: {type: stdio}}\n"),
+			`registryType "cargo" is not supported`,
 		},
-		"environment variables": {
+		"fleet package with a runtime hint": {
+			server(header + "        packages:\n          - {registryType: fleet, identifier: c, runtimeHint: npx, transport: {type: stdio}}\n"),
+			"runtimeHint, runtimeArguments and version do not apply",
+		},
+		"npm package with the wrong runtime": {
+			server(header + "        packages:\n          - {registryType: npm, identifier: c, runtimeHint: docker, transport: {type: stdio}}\n"),
+			`npm packages run with npx, not "docker"`,
+		},
+		"environment variable without a value": {
 			server(header + "        packages:\n          - registryType: fleet\n            identifier: c\n            transport: {type: stdio}\n            environmentVariables: [{name: TOKEN}]\n"),
-			"environmentVariables are not supported",
+			"environment variable TOKEN needs a value or default",
+		},
+		"secret written into the file": {
+			server(header + "        remotes:\n          - type: streamable-http\n            url: https://c.example/mcp\n            headers: [{name: Authorization, value: Bearer hunter2, isSecret: true}]\n"),
+			"must come from a {variable} bound in env:",
+		},
+		"unbound variable": {
+			server(header + "        remotes:\n          - type: streamable-http\n            url: https://c.example/mcp\n            headers: [{name: Authorization, value: \"Bearer {token}\"}]\n"),
+			"{token} has no value",
+		},
+		"unused env binding": {
+			server("      env: {token: C_TOKEN}\n" + header + "        remotes:\n          - {type: streamable-http, url: https://c.example/mcp}\n"),
+			"env: token is not used",
+		},
+		"env binding to a lowercase name": {
+			server("      env: {token: c_token}\n" + header + "        remotes:\n          - type: streamable-http\n            url: https://c.example/mcp\n            headers: [{name: Authorization, value: \"Bearer {token}\"}]\n"),
+			"not an UPPER_SNAKE environment variable name",
+		},
+		"unknown os": {
+			"toolchain:\n  tools:\n    - name: tracker\n      version: v1\n      os: [macos]\n",
+			`os "macos" must be one of`,
+		},
+		"use_when without a server": {
+			"toolchain:\n  tools:\n    - name: tracker\n      version: v1\n      use_when: always\n",
+			"need a server",
+		},
+		"headers helper on a package": {
+			server("      headers_helper: print-headers\n" + header + fleetPackage),
+			"headers_helper only applies to a remote",
 		},
 		"remote without host": {
 			server("      where: [tag:server]\n" + header + "        remotes:\n          - {type: streamable-http, url: http://server:80/mcp}\n"),
@@ -181,11 +217,11 @@ func TestValidateRejectsTheThingsThatMakeTheCatalogUseless(t *testing.T) {
 		},
 		"remote without where": {
 			server(header + "        remotes:\n          - {type: streamable-http, url: \"http://{host}:80/mcp\"}\n"),
-			"needs a where tag",
+			"{host} needs a where tag",
 		},
 		"remote variable without a value": {
 			server("      where: [tag:server]\n" + header + "        remotes:\n          - {type: streamable-http, url: \"http://{host}:{port}/mcp\"}\n"),
-			"{port} needs a value or default",
+			"{port} has no value",
 		},
 		"sse remote": {
 			server("      where: [tag:server]\n" + header + "        remotes:\n          - {type: sse, url: \"http://{host}:80/sse\"}\n"),
@@ -223,9 +259,9 @@ func TestResolvePackagesRunLocallyWithTheirArguments(t *testing.T) {
 	eps, _ := Resolve(parse(t, sample), status(&tailnet.Node{Host: "laptop"}))
 	byName := map[string]Endpoint{}
 	for _, e := range eps {
-		byName[e.Tool.Name] = e
+		byName[e.Name] = e
 	}
-	if got := byName["tracker"]; got.Command != "tracker" || strings.Join(got.Args, " ") != "mcp --profile agents" {
+	if got := byName["tracker"]; got.Command != "tracker" || joinArgs(got.Args) != "mcp --profile agents" {
 		t.Fatalf("tracker endpoint = %+v", got)
 	}
 	if got := byName["deployer"]; got.Command != "deployer-mcp" || len(got.Args) != 0 {
@@ -243,8 +279,8 @@ func TestResolveRemoteFillsHostAndDefaults(t *testing.T) {
 		t.Fatalf("Resolve: %v", err)
 	}
 	for _, e := range eps {
-		if e.Tool.Name == "operations" {
-			if e.URL != "http://server.ts.net:8787/mcp" {
+		if e.Name == "operations" {
+			if e.URL.String() != "http://server.ts.net:8787/mcp" {
 				t.Fatalf("operations URL = %q", e.URL)
 			}
 			return
@@ -298,4 +334,12 @@ func TestConfigRendersBothTransports(t *testing.T) {
 	if got := cfg["operations"]; got.Type != "http" || got.URL == "" || got.Command != "" {
 		t.Fatalf("operations server = %+v", got)
 	}
+}
+
+func joinArgs(args []Template) string {
+	parts := make([]string, len(args))
+	for i, a := range args {
+		parts[i] = a.String()
+	}
+	return strings.Join(parts, " ")
 }
